@@ -2,6 +2,31 @@
 
 一个 Tampermonkey 用户脚本，在任意网页提供可拖拽的多模型生成入口。支持文生图、文生视频、图生视频、语音合成、图片转 3D，以及免费额度的文本对话（Qwen3 / GLM4 / DeepSeek-R1 系列）和语音识别（GLM-ASR / SenseVoice），自动获取访问令牌、轮询异步任务、预览与下载结果、保存历史记录。
 
+## 免责声明
+
+**本项目仅供个人学习与研究使用，严禁用于任何商业用途。**
+
+- 生成内容（图片 / 视频 / 3D 模型 / 音频）的版权与合规性由使用者自行负责
+- 请遵守 Gitee AI 平台服务条款及各模型的授权协议
+- 请勿利用本工具生成违法违规内容
+- 使用本脚本产生的一切后果由使用者自行承担
+
+## 可调用模型与画质
+
+使用官方体验令牌时，总额度为 **100 次 / 天**，面板会实时显示当日剩余次数；文本对话与语音识别不占用该额度（平台免费开放）。
+
+| 模式 | 模型 | 画质 / 规格 |
+|---|---|---|
+| 文生图 | Z-Image Turbo、FLUX.1 Schnell、FLUX.1/2 Dev、FLUX.2 Klein 4B/9B、FLUX.1 Krea Dev、CogView4 6B、GLM Image、HiDream I1 Full、Kolors、LongCat Image、Qwen Image / 2512、SD 3 Medium / 3.5 Large Turbo、SDXL Base、Z-Image（共 18 款） | 默认 **1024 × 1024 高清**；可选 1024×768 (4:3)、768×1024 (3:4)、**1536×864 (16:9)** |
+| 文生视频 | HunyuanVideo 1.5、Wan2.1 T2V 14B | 最长 81 帧，16/24 fps，支持 16:9 / 9:16 / 1:1 |
+| 图生视频 | LTX-2、Wan2.2 I2V A14B | 最长 73 帧，最高 32 fps |
+| 语音合成 | Spark TTS 0.5B | 支持男女声、音调与语速 1-5 级调节 |
+| 图片转 3D | Hunyuan3D 2、Hi3DGen | 输出 GLB / STL；MC 分辨率默认 512，面数约 8 万 |
+| 文本对话 🆓 | Qwen3 系列、GLM4 系列、DeepSeek R1 蒸馏系列、书生·浦语3、DeepSeek Prover（数学）、华佗 GPT / 灵枢 / HealthGPT（医疗）等 14 款 | 多轮对话自动携带上下文，全部免费 |
+| 语音识别 🆓 | GLM-ASR（轻量中文）、SenseVoice Small（中英日韩多语种） | 支持 mp3 / wav / m4a，全部免费 |
+
+文生图面板中，Z-Image Turbo 和 FLUX.1 Schnell 为实测验证过的推荐模型，出图速度快、质量稳定。
+
 ## 安装
 
 1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/) 扩展。
@@ -24,4 +49,4 @@
 
 ## 许可
 
-仅供个人学习与内部使用。
+仅供个人学习与内部使用，禁止商业用途。
