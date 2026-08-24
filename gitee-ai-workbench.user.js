@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.6.2
+// @version      2.6.3
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、结果预览、下载与历史记录。
 // @author       Antigravity
 // @match        *://*/*
@@ -1301,7 +1301,13 @@
                 </div>
 
                 <div class="zimg-panel" id="zimg-panel-speech">
-                    <div class="zimg-field"><span class="zimg-label">🔊 语音模型</span><select id="zimg-model-speech" class="zimg-input"></select></div>
+                    <div class="zimg-field">
+                        <div class="zimg-label-row">
+                            <span class="zimg-label">🔊 语音模型 <span class="zimg-badge-gitee" style="font-size:10px;">🆓 免费</span></span>
+                        </div>
+                        <select id="zimg-model-speech" class="zimg-input"></select>
+                        <div class="zimg-model-note">🆓 Spark TTS 支持男女声、音调与语速调节。</div>
+                    </div>
                     <div class="zimg-grid" style="margin-top:16px;">
                         <div class="zimg-field">
                             <div class="zimg-label-row"><span class="zimg-label">🚻 音色性别</span></div>
@@ -1457,12 +1463,12 @@
             <div class="zimg-agent-body">
                 <div class="zimg-agent-hint">
                     📄 下方是一份 Markdown 接口指南（含认证方式、全部端点、模型清单与 curl 示例）。<br />
-                    · 下载后放到项目里（如 <b>docs/gitee-ai.md</b>，或并入 <b>AGENTS.md / CLAUDE.md</b>），Codex、Claude Code 等 Agent 读到即可直接调用这些接口；<br />
+                    · 下载后放到项目里（如 <b>docs/gitee-ai-agents.md</b>，或并入 <b>AGENTS.md / CLAUDE.md</b>），Codex、Claude Code 等 Agent 读到即可直接调用这些接口；<br />
                     · 也可直接复制全文粘贴给任何 Agent 使用；<br />
                     · 文档在本地生成，<b>不会上传到任何服务器</b>。
                 </div>
                 <div class="zimg-agent-token-row">
-                    <input type="checkbox" id="zimg-agent-include-token" checked />
+                    <input type="checkbox" id="zimg-agent-include-token" />
                     <span>在文档中包含当前访问令牌（含令牌的文件请勿公开分享 / 提交到公开仓库）</span>
                 </div>
                 <textarea id="zimg-agent-text" class="zimg-agent-textarea" readonly spellcheck="false"></textarea>
