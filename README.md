@@ -1,6 +1,20 @@
 # Gitee AI 多模型生成工作台
 
-一个 Tampermonkey 用户脚本，在任意网页提供可拖拽的多模型生成入口。支持文生图、文生视频、图生视频、语音合成、图片转 3D，以及免费额度的文本对话（Qwen3 / GLM4 / DeepSeek-R1 系列）和语音识别（GLM-ASR / SenseVoice），自动获取访问令牌、轮询异步任务、预览与下载结果、保存历史记录。
+  基于 Tampermonkey 开发的油猴用户脚本，在任意网页提供可拖拽的多模型生成入口；自动获取访问令牌与额度，支持异步任务轮询、结果预览、下载与历史记录，并可一键导出 Agent 提示词供 Codex / Claude Code 直接调用接口。
+
+  [![GitHub](https://img.shields.io/badge/GitHub-haremank%2Fgitee--ai--agents--guide-blue?style=flat&logo=github)](https://github.com/haremank/gitee-ai-agents-guide)
+[![Version](https://img.shields.io/badge/版本-v2.6.2-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
+[![Usage](https://img.shields.io/badge/用途-仅限个人学习-red)](#免责声明)
+<br /><br />
+
+## 下载安装
+
+- **一键安装**：登录 GitHub 后点击 [最新版脚本直装链接](https://github.com/haremank/gitee-ai-agents-guide/releases/latest/download/gitee-ai-workbench.user.js)，Tampermonkey 自动弹出安装页
+- **手动安装**：前往 [Releases 页面](https://github.com/haremank/gitee-ai-agents-guide/releases/latest) 下载 `gitee-ai-workbench.user.js`，在 Tampermonkey 面板 → 添加新脚本 → 粘贴全部内容并保存
+
+> 前置要求：浏览器需已安装 [Tampermonkey](https://www.tampermonkey.net/) 扩展。安装完成后打开任意网页即可看到悬浮工作台入口。
+
+<br />
 
 ## 免责声明
 
@@ -10,6 +24,8 @@
 - 请遵守 Gitee AI 平台服务条款及各模型的授权协议
 - 请勿利用本工具生成违法违规内容
 - 使用本脚本产生的一切后果由使用者自行承担
+
+<br />
 
 ## 可调用模型与画质
 
@@ -27,13 +43,7 @@
 
 文生图面板中，Z-Image Turbo 和 FLUX.1 Schnell 为实测验证过的推荐模型，出图速度快、质量稳定。
 
-## 安装
-
-1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/) 扩展。
-2. 获取脚本（二选一）：
-   - **直装**：浏览器登录 GitHub 后打开 [gitee-ai-workbench.user.js 原始文件](https://github.com/haremank/gitee-ai-agents-guide/raw/main/gitee-ai-workbench.user.js)，Tampermonkey 会自动弹出安装页
-   - **手动**：下载该文件后，在 Tampermonkey 面板 → 添加新脚本 → 粘贴全部内容并保存
-3. 打开任意网页即可看到悬浮工作台入口。
+<br />
 
 ## 核心功能
 
@@ -41,6 +51,8 @@
 - **令牌自动管理**：自动从 Gitee AI 页面提取体验令牌与剩余额度，也可手动粘贴个人专属 API Key；输入框为密码框，令牌仅保存在浏览器本地存储
 - **一键导出 Agent 提示词**：生成 Markdown 格式的 API 调用指南，供 Codex / Claude Code 等 Agent 直接调用接口；导出的指南见 [`docs/gitee-ai-agents.md`](docs/gitee-ai-agents.md)
 - **异步任务全流程**：提交任务 → 自动轮询 → 结果预览 / 下载 / 历史记录
+
+<br />
 
 ## 导入 Agent 教学
 
@@ -89,13 +101,11 @@ $env:GITEE_AI_TOKEN = "<你的令牌>"
 
 Agent 能正常返回结果，说明导入完成。之后就可以直接下发生图、生视频等任务了。
 
+<br />
+
 ## 密钥安全约定
 
 - 本仓库的代码与文档中不含任何明文密钥
 - 脚本内置假令牌黑名单过滤，避免误用文档示例 Token
 - 通过脚本使用时，令牌仅存于浏览器本地（GM 存储 / localStorage），不写入文件
 - 若参考导出指南写自己的调用代码，请通过环境变量提供令牌（如 `GITEE_AI_TOKEN`），切勿硬编码或提交 `.env`
-
-## 许可
-
-仅供个人学习与内部使用，禁止商业用途。
