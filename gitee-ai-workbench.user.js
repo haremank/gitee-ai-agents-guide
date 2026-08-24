@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.6.3
-// @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、结果预览、下载与历史记录。
+// @version      2.6.4
+// @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；图片与图生视频最高支持 4K 参数。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、结果预览、下载与历史记录。
 // @author       Antigravity
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -1235,6 +1235,8 @@
                                 <option value="768x1024">768 × 1024（3:4）</option>
                                 <option value="1536x864">1536 × 864（16:9）</option>
                                 <option value="2048x2048">2048 × 2048（超清）</option>
+                                <option value="3840x2160">3840 × 2160（4K 横屏）</option>
+                                <option value="2160x3840">2160 × 3840（4K 竖屏）</option>
                             </select>
                         </div>
                         <div class="zimg-field">
@@ -1285,8 +1287,8 @@
                     <input type="file" id="zimg-i2v-file" class="zimg-file-input" accept="image/*" />
                     <div class="zimg-field" style="margin-top:16px;"><span class="zimg-label">📹 图生视频模型</span><select id="zimg-model-image-video" class="zimg-input"></select></div>
                     <div class="zimg-grid-three" style="margin-top:16px;">
-                        <div class="zimg-field"><span class="zimg-label">🖼 宽度</span><input type="number" id="zimg-i2v-width" class="zimg-input" value="512" min="256" max="1280" step="8" /></div>
-                        <div class="zimg-field"><span class="zimg-label">📏 高度</span><input type="number" id="zimg-i2v-height" class="zimg-input" value="512" min="256" max="1280" step="8" /></div>
+                        <div class="zimg-field"><span class="zimg-label">🖼 宽度</span><input type="number" id="zimg-i2v-width" class="zimg-input" value="512" min="256" max="3840" step="8" /></div>
+                        <div class="zimg-field"><span class="zimg-label">📏 高度</span><input type="number" id="zimg-i2v-height" class="zimg-input" value="512" min="256" max="3840" step="8" /></div>
                         <div class="zimg-field"><span class="zimg-label">🖼 帧数</span><select id="zimg-i2v-frames" class="zimg-input"><option value="73">73</option><option value="33">33</option><option value="25">25</option><option value="17">17</option></select></div>
                     </div>
                     <div class="zimg-grid-three" style="margin-top:16px;">
@@ -1297,9 +1299,20 @@
                             <input type="range" id="zimg-i2v-steps" class="zimg-range" min="1" max="30" value="8" />
                         </div>
                     </div>
-                    <div class="zimg-field" style="margin-top:16px;"><span class="zimg-label">🎲 Seed</span><input type="number" id="zimg-i2v-seed" class="zimg-input" placeholder="随机" /></div>
-                </div>
-
+                    <div class="zimg-grid" style="margin-top:16px;">
+                        <div class="zimg-field">
+                            <div class="zimg-label-row"><span class="zimg-label">🧭 分辨率预设</span><span class="zimg-label-sub">最高 4K，模型兼容性可能不同</span></div>
+                            <select id="zimg-i2v-resolution" class="zimg-input">
+                                <option value="">自定义</option>
+                                <option value="512x512" selected>512 × 512（快速）</option>
+                                <option value="1280x720">1280 × 720（HD）</option>
+                                <option value="1920x1080">1920 × 1080（FHD）</option>
+                                <option value="3840x2160">3840 × 2160（4K 横屏）</option>
+                                <option value="2160x3840">2160 × 3840（4K 竖屏）</option>
+                            </select>
+                        </div>
+                        <div class="zimg-field"><span class="zimg-label">🎲 Seed</span><input type="number" id="zimg-i2v-seed" class="zimg-input" placeholder="随机" /></div>
+                    </div>
                 <div class="zimg-panel" id="zimg-panel-speech">
                     <div class="zimg-field">
                         <div class="zimg-label-row">
@@ -1573,6 +1586,26 @@
     ].forEach(([slider, display]) => {
         slider.addEventListener('input', () => setSliderValue(slider, display));
     });
+
+    const i2vWidthInput = document.getElementById('zimg-i2v-width');
+    const i2vHeightInput = document.getElementById('zimg-i2v-height');
+    const i2vResolutionSelect = document.getElementById('zimg-i2v-resolution');
+
+    function syncImageVideoResolution() {
+        const [width, height] = i2vResolutionSelect.value.split('x').map(Number);
+        i2vWidthInput.value = width;
+        i2vHeightInput.value = height;
+    }
+
+    function syncImageVideoPreset() {
+        const value = `${i2vWidthInput.value}x${i2vHeightInput.value}`;
+        i2vResolutionSelect.value = [...i2vResolutionSelect.options].some(option => option.value === value)
+            ? value
+            : '';
+    }
+
+    i2vResolutionSelect.addEventListener('change', syncImageVideoResolution);
+    [i2vWidthInput, i2vHeightInput].forEach(input => input.addEventListener('input', syncImageVideoPreset));
 
     function getModelConfig(mode = currentMode) {
         return MODEL_REGISTRY[mode].models.find(model => model.value === getModeSelect(mode).value);
@@ -1966,7 +1999,7 @@
             '  }\'',
             '```',
             '',
-            '可调参数：`size`(如 1024x1024 / 1536x864)、`width`/`height`、`num_inference_steps`、`negative_prompt`、`guidance_scale`、`seed`、`num_images_per_prompt`、`response_format`(`url` 或 `b64_json`)。',
+            '可调参数：`size`(如 1024x1024 / 1536x864 / **3840x2160** / **2160x3840**)、`width`/`height`、`num_inference_steps`、`negative_prompt`、`guidance_scale`、`seed`、`num_images_per_prompt`、`response_format`(`url` 或 `b64_json`)。最高可传 4K；个别模型对超大尺寸或特定比例可能拒绝请求。',
             '响应：`data[0].url` 或 `data[0].b64_json`；`b64_json` 数据量大，除非要离线保存，优先用 `url`。',
             '',
             '### 1.3 语音识别（🆓 全部免费）— `POST /v1/audio/transcriptions`',
@@ -2011,13 +2044,13 @@
             '',
             '模型：' + listModels('textVideo'),
             '',
-            'JSON 参数：`model`、`prompt`、`num_frames`(如 81)、`num_inference_steps`、`negative_prompt`、`seed`、`aspect_ratio`("16:9"/"9:16"/"1:1")、`fps`(16/24)。',
+            'JSON 参数：`model`、`prompt`、`num_frames`(如 81)、`num_inference_steps`、`negative_prompt`、`seed`、`aspect_ratio`("16:9"/"9:16"/"1:1")、`fps`(16/24)。文生视频通过画面比例控制构图，最终分辨率由模型决定。',
             '',
             '### 2.2 图生视频 — `POST /v1/async/videos/image-to-video`',
             '',
             '模型：' + listModels('imageVideo'),
             '',
-            'multipart 参数：`model`、`image`(图片文件)、`prompt`、`num_frames`、`width`、`height`、`num_inference_steps`、`fps`、`guidance_scale`、`seed`、`negative_prompt`。',
+            'multipart 参数：`model`、`image`(图片文件)、`prompt`、`num_frames`、`width`、`height`、`num_inference_steps`、`fps`、`guidance_scale`、`seed`、`negative_prompt`。常用分辨率：1280x720、1920x1080、3840x2160（4K 横屏）、2160x3840（4K 竖屏）；实际输出受所选模型限制。',
             '',
             '### 2.3 语音合成（🆓 免费）— `POST /v1/async/audio/speech`',
             '',

@@ -67,7 +67,7 @@ curl https://ai.gitee.com/v1/images/generations \
   }'
 ```
 
-可调参数：`size`(如 1024x1024 / 1536x864)、`width`/`height`、`num_inference_steps`、`negative_prompt`、`guidance_scale`、`seed`、`num_images_per_prompt`、`response_format`(`url` 或 `b64_json`)。
+可调参数：`size`(如 1024x1024 / 1536x864 / **3840x2160** / **2160x3840**)、`width`/`height`、`num_inference_steps`、`negative_prompt`、`guidance_scale`、`seed`、`num_images_per_prompt`、`response_format`(`url` 或 `b64_json`)。最高可传 4K；个别模型对超大尺寸或特定比例可能拒绝请求。
 响应：`data[0].url` 或 `data[0].b64_json`；`b64_json` 数据量大，除非要离线保存，优先用 `url`。
 
 ### 1.3 语音识别（🆓 全部免费）— `POST /v1/audio/transcriptions`
@@ -112,13 +112,13 @@ curl https://ai.gitee.com/api/v1/task/$TASK_ID -H "Authorization: Bearer $TOKEN"
 
 模型：`HunyuanVideo-1.5`、`Wan2.1-T2V-14B`
 
-JSON 参数：`model`、`prompt`、`num_frames`(如 81)、`num_inference_steps`、`negative_prompt`、`seed`、`aspect_ratio`("16:9"/"9:16"/"1:1")、`fps`(16/24)。
+JSON 参数：`model`、`prompt`、`num_frames`(如 81)、`num_inference_steps`、`negative_prompt`、`seed`、`aspect_ratio`("16:9"/"9:16"/"1:1")、`fps`(16/24)。文生视频通过画面比例控制构图，最终分辨率由模型决定。
 
 ### 2.2 图生视频 — `POST /v1/async/videos/image-to-video`
 
 模型：`LTX-2`、`Wan2_2-I2V-A14B`
 
-multipart 参数：`model`、`image`(图片文件)、`prompt`、`num_frames`、`width`、`height`、`num_inference_steps`、`fps`、`guidance_scale`、`seed`、`negative_prompt`。
+multipart 参数：`model`、`image`(图片文件)、`prompt`、`num_frames`、`width`、`height`、`num_inference_steps`、`fps`、`guidance_scale`、`seed`、`negative_prompt`。常用分辨率：1280x720、1920x1080、3840x2160（4K 横屏）、2160x3840（4K 竖屏）；实际输出受所选模型限制。
 
 ### 2.3 语音合成（🆓 免费）— `POST /v1/async/audio/speech`
 
