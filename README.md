@@ -1,36 +1,26 @@
-# Gitee AI Serverless API — Agent 调用指南
+# Gitee AI 多模型生成工作台
 
-一份面向 AI 编程助手（Codex、Claude Code、Cursor 等）的 Gitee AI Serverless API 调用指南，覆盖文本对话、文生图、语音识别、语音合成、文生视频、图生视频、图片转 3D 等能力的 HTTP 调用方式、异步任务轮询流程与错误处理约定。
+一个 Tampermonkey 用户脚本，在任意网页提供可拖拽的多模型生成入口。支持文生图、文生视频、图生视频、语音合成、图片转 3D，以及免费额度的文本对话（Qwen3 / GLM4 / DeepSeek-R1 系列）和语音识别（GLM-ASR / SenseVoice），自动获取访问令牌、轮询异步任务、预览与下载结果、保存历史记录。
 
-## 内容
+## 安装
 
-- **同步接口**：文本对话（OpenAI 兼容格式）、文生图、语音识别
-- **异步接口**：提交任务 → 每 4 秒轮询 → 取回结果的统一流程
-- **Agent 行为约定**：免费模型优先、轮询纪律、错误退避重试、产物落地规范
-- **端点速查表**：全部已整理端点的一览表
+1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/) 扩展。
+2. 新建脚本，粘贴 `gitee-ai-workbench.user.js` 全部内容并保存。
+3. 打开任意网页即可看到悬浮工作台入口。
 
-## 使用前配置
+## 核心功能
 
-1. 登录 https://ai.gitee.com/serverless-api 创建 API Token（36-44 位大写字母数字）。
-2. 通过环境变量提供令牌，切勿写入任何文件：
+- **多模式面板**：按文生图 / 文生视频 / 图生视频 / 语音合成 / 图片转 3D / 文本对话 / 语音识别显示对应参数面板
+- **令牌自动管理**：自动从 Gitee AI 页面提取体验令牌与剩余额度，也可手动粘贴个人专属 API Key；输入框为密码框，令牌仅保存在浏览器本地存储
+- **一键导出 Agent 提示词**：生成 Markdown 格式的 API 调用指南，供 Codex / Claude Code 等 Agent 直接调用接口；导出的指南见 [`docs/gitee-ai-agents.md`](docs/gitee-ai-agents.md)
+- **异步任务全流程**：提交任务 → 自动轮询 → 结果预览 / 下载 / 历史记录
 
-```bash
-# Linux / macOS
-export GITEE_AI_TOKEN=<你的令牌>
-```
+## 密钥安全约定
 
-```powershell
-# Windows PowerShell
-$env:GITEE_AI_TOKEN = "<你的令牌>"
-```
-
-3. 文档中的 curl 示例使用 `$TOKEN` 占位，执行前先 `export TOKEN=$GITEE_AI_TOKEN`。
-
-## 注意事项
-
-- 标注 🆓 的模型为免费模型，优先使用；其余模型按量计费，调用前确认费用。
-- 含真实令牌的文件禁止提交到任何仓库；`.env` 等密钥文件必须加入 `.gitignore`。
-- 使用本指南即表示同意遵守 Gitee AI 服务条款及各模型的授权协议。
+- 本仓库的代码与文档中不含任何明文密钥
+- 脚本内置假令牌黑名单过滤，避免误用文档示例 Token
+- 通过脚本使用时，令牌仅存于浏览器本地（GM 存储 / localStorage），不写入文件
+- 若参考导出指南写自己的调用代码，请通过环境变量提供令牌（如 `GITEE_AI_TOKEN`），切勿硬编码或提交 `.env`
 
 ## 许可
 
