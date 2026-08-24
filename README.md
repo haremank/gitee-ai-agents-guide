@@ -30,7 +30,9 @@
 ## 安装
 
 1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/) 扩展。
-2. 新建脚本，粘贴 `gitee-ai-workbench.user.js` 全部内容并保存。
+2. 获取脚本（二选一）：
+   - **直装**：浏览器登录 GitHub 后打开 [gitee-ai-workbench.user.js 原始文件](https://github.com/haremank/gitee-ai-agents-guide/raw/main/gitee-ai-workbench.user.js)，Tampermonkey 会自动弹出安装页
+   - **手动**：下载该文件后，在 Tampermonkey 面板 → 添加新脚本 → 粘贴全部内容并保存
 3. 打开任意网页即可看到悬浮工作台入口。
 
 ## 核心功能
@@ -39,6 +41,53 @@
 - **令牌自动管理**：自动从 Gitee AI 页面提取体验令牌与剩余额度，也可手动粘贴个人专属 API Key；输入框为密码框，令牌仅保存在浏览器本地存储
 - **一键导出 Agent 提示词**：生成 Markdown 格式的 API 调用指南，供 Codex / Claude Code 等 Agent 直接调用接口；导出的指南见 [`docs/gitee-ai-agents.md`](docs/gitee-ai-agents.md)
 - **异步任务全流程**：提交任务 → 自动轮询 → 结果预览 / 下载 / 历史记录
+
+## 导入 Agent 教学
+
+把工作台导出的接口指南交给 Codex、Claude Code 等 Agent，让它们直接帮你调接口：
+
+### 第一步：导出指南
+
+点击工作台上的「🤖 Agent 提示词」按钮，弹窗中可以：
+
+- 一键复制全文；或
+- 点击下载，得到 Markdown 文件（即本仓库 [`docs/gitee-ai-agents.md`](docs/gitee-ai-agents.md) 的内容）
+
+### 第二步：放入你的项目
+
+任选一种方式放置指南文件：
+
+```
+your-project/
+├── AGENTS.md          ← 把指南全文追加到末尾
+├── CLAUDE.md          ← 或并入 Claude Code 的项目说明
+└── docs/
+    └── gitee-ai.md    ← 或作为独立文档存放
+```
+
+Agent 会自动读取项目根目录的 `AGENTS.md` / `CLAUDE.md`；放在 `docs/` 下时，首次使用前告诉 Agent「参考 docs/gitee-ai.md 调用 Gitee AI 接口」即可。
+
+### 第三步：配置令牌
+
+在终端设置环境变量，**不要**把令牌写进任何文件：
+
+```bash
+# Linux / macOS
+export GITEE_AI_TOKEN=<你的令牌>
+```
+
+```powershell
+# Windows PowerShell
+$env:GITEE_AI_TOKEN = "<你的令牌>"
+```
+
+### 第四步：验证
+
+启动 Agent 后让它执行一条测试指令，例如：
+
+> 参考 gitee-ai 指南，用 Qwen3-8B 回复"你好"
+
+Agent 能正常返回结果，说明导入完成。之后就可以直接下发生图、生视频等任务了。
 
 ## 密钥安全约定
 
