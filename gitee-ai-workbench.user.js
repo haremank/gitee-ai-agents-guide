@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.7.0
-// @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与历史记录。
+// @version      2.8.0
+// @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -10,6 +10,7 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @connect      ai.gitee.com
+// @connect      gitee-ai.su.bcebos.com
 // @connect      raw.githubusercontent.com
 // @resource GITEE_CONTROLS https://raw.githubusercontent.com/haremank/gitee-ai-agents-guide/main/assets/gitee-serverless-controls.compact.json
 // @run-at       document-idle
@@ -120,6 +121,9 @@
 
     const STORAGE_TOKEN_KEY = 'gitee_ai_custom_token';
     const STORAGE_HISTORY_KEY = 'gitee_ai_zimage_history';
+    const LIBRARY_DB_NAME = 'gitee-ai-workbench-library';
+    const LIBRARY_DB_VERSION = 1;
+    const LIBRARY_STORE = 'items';
     const STORAGE_FAB_POS = 'gitee_ai_zimage_fab_pos';
     const STORAGE_QUOTA_KEY = 'gitee_ai_zimage_live_quota';
     const API_BASE = "https://ai.gitee.com";
@@ -233,10 +237,182 @@
     let generateTimer = null;
     let generateStartTime = 0;
     let historyList = [];
+    let libraryDb = null;
+    let libraryReady = null;
+    let libraryInitPromise = null;
+    let libraryList = [];
+    let libraryFilter = 'all';
+    let libraryQuery = '';
+    let libraryObjectUrls = [];
     try {
         const savedHist = safeGM.getValue(STORAGE_HISTORY_KEY, '') || localStorage.getItem(STORAGE_HISTORY_KEY);
         if (savedHist) historyList = JSON.parse(savedHist);
     } catch(e) {}
+
+    function openLibrary() {
+        if (libraryReady) return libraryReady;
+        libraryReady = new Promise((resolve) => {
+            if (typeof indexedDB === 'undefined' || !indexedDB) {
+                resolve(null);
+                return;
+            }
+            const request = indexedDB.open(LIBRARY_DB_NAME, LIBRARY_DB_VERSION);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(LIBRARY_STORE)) {
+                    const store = db.createObjectStore(LIBRARY_STORE, { keyPath: 'id' });
+                    store.createIndex('createdAt', 'createdAt');
+                }
+            };
+            request.onsuccess = () => {
+                libraryDb = request.result;
+                resolve(libraryDb);
+            };
+            request.onerror = () => resolve(null);
+        });
+        return libraryReady;
+    }
+
+    function withLibrary(mode, callback) {
+        return openLibrary().then(db => new Promise((resolve, reject) => {
+            if (!db) {
+                reject(new Error('indexeddb-unavailable'));
+                return;
+            }
+            const tx = db.transaction(LIBRARY_STORE, mode);
+            const store = tx.objectStore(LIBRARY_STORE);
+            const request = callback(store);
+            tx.oncomplete = () => resolve(request && 'result' in request ? request.result : undefined);
+            tx.onerror = () => reject(tx.error || new Error('本地库读写失败'));
+            tx.onabort = () => reject(tx.error || new Error('本地库操作被中断'));
+        }));
+    }
+
+    function hashString(value) {
+        let hash = 2166136261;
+        const text = String(value || '');
+        for (let i = 0; i < text.length; i++) {
+            hash ^= text.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        return (hash >>> 0).toString(36);
+    }
+
+    function formatBytes(size) {
+        const bytes = Number(size) || 0;
+        if (bytes < 1024) return `${bytes} B`;
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+        if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+        return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+    }
+
+    function mimeForExt(ext) {
+        const types = {
+            png: 'image/png',
+            jpg: 'image/jpeg',
+            jpeg: 'image/jpeg',
+            webp: 'image/webp',
+            gif: 'image/gif',
+            mp4: 'video/mp4',
+            webm: 'video/webm',
+            mov: 'video/quicktime',
+            mp3: 'audio/mpeg',
+            mpeg: 'audio/mpeg',
+            wav: 'audio/wav',
+            ogg: 'audio/ogg',
+            m4a: 'audio/mp4',
+            glb: 'model/gltf-binary',
+            stl: 'model/stl',
+            obj: 'text/plain'
+        };
+        return types[String(ext || '').toLowerCase()] || 'application/octet-stream';
+    }
+
+    async function requestBlob(url) {
+        if (!url) throw new Error('结果地址为空');
+        if (/^data:/i.test(url)) {
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`本地数据读取失败：HTTP ${response.status}`);
+            return response.blob();
+        }
+        try {
+            const response = await fetch(url, { mode: 'cors', credentials: 'omit' });
+            if (response.ok) {
+                const blob = await response.blob();
+                if (blob.size > 0) return blob;
+            }
+        } catch (_) {}
+        const response = await makeRequest({
+            method: 'GET',
+            url,
+            responseType: 'arraybuffer',
+            timeout: 120000
+        });
+        if (response.status < 200 || response.status >= 300) {
+            throw new Error(`结果下载失败：HTTP ${response.status}`);
+        }
+        const body = response.response;
+        if (!body || !body.byteLength) throw new Error('结果下载内容为空');
+        let mime = '';
+        try {
+            const rawHeaders = String(response.responseHeaders || '');
+            const match = rawHeaders.match(/content-type:\s*([^\r\n;]+)/i);
+            if (match) mime = match[1].trim();
+        } catch (_) {}
+        return new Blob([body], { type: mime || mimeForExt(extFromUrl(url, 'bin')) });
+    }
+
+    function waitForMedia(element, eventName, url) {
+        return new Promise(resolve => {
+            const cleanup = () => {
+                clearTimeout(timer);
+                element.removeEventListener(eventName, onReady);
+                element.removeEventListener('error', onError);
+            };
+            const onReady = () => {
+                cleanup();
+                resolve(true);
+            };
+            const onError = () => {
+                cleanup();
+                resolve(false);
+            };
+            const timer = setTimeout(() => {
+                cleanup();
+                resolve(false);
+            }, 8000);
+            element.addEventListener(eventName, onReady);
+            element.addEventListener('error', onError);
+            element.src = url;
+            element.load?.();
+        });
+    }
+
+    async function probeMedia(blob, kind) {
+        if (!blob || (kind !== 'image' && kind !== 'video' && kind !== 'audio')) {
+            return { width: undefined, height: undefined, duration: undefined };
+        }
+        const url = URL.createObjectURL(blob);
+        try {
+            if (kind === 'image') {
+                const image = new Image();
+                await waitForMedia(image, 'load', url);
+                return { width: image.naturalWidth || undefined, height: image.naturalHeight || undefined, duration: undefined };
+            }
+            const element = document.createElement(kind === 'video' ? 'video' : 'audio');
+            element.preload = 'metadata';
+            element.muted = true;
+            await waitForMedia(element, 'loadedmetadata', url);
+            const duration = Number.isFinite(element.duration) ? Math.round(element.duration * 10) / 10 : undefined;
+            return {
+                width: kind === 'video' ? (element.videoWidth || undefined) : undefined,
+                height: kind === 'video' ? (element.videoHeight || undefined) : undefined,
+                duration
+            };
+        } finally {
+            URL.revokeObjectURL(url);
+        }
+    }
 
     // 今日日期键
     function getTodayKey() {
@@ -904,6 +1080,75 @@
             overflow-x: auto;
             padding: 8px 2px;
         }
+        .zimg-library-controls {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 108px;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .zimg-library-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+            gap: 10px;
+        }
+        .zimg-library-item {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #f8fafc;
+            cursor: pointer;
+        }
+        .zimg-library-item:hover { border-color: #6366f1; box-shadow: 0 4px 12px rgba(79,70,229,.14); }
+        .zimg-library-item img {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .zimg-library-chip,
+        .zimg-library-badge {
+            position: absolute;
+            left: 6px;
+            bottom: 6px;
+            max-width: calc(100% - 12px);
+            padding: 2px 5px;
+            border-radius: 5px;
+            background: rgba(15,23,42,.78);
+            color: #fff !important;
+            font-size: 10px;
+            line-height: 1.3;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .zimg-library-chip { position: static; display: flex; align-items: center; justify-content: center; height: 100%; font-size: 20px; }
+        .zimg-library-badge { top: 6px; bottom: auto; background: rgba(79,70,229,.92); }
+        .zimg-library-delete {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            width: 20px;
+            height: 20px;
+            border: 0;
+            border-radius: 5px;
+            background: rgba(220,38,38,.92);
+            color: #fff !important;
+            font-size: 11px;
+            line-height: 20px;
+            cursor: pointer;
+        }
+        .zimg-library-empty {
+            grid-column: 1 / -1;
+            padding: 18px;
+            border: 1px dashed #cbd5e1;
+            border-radius: 8px;
+            text-align: center;
+            color: #64748b !important;
+            font-size: 12px;
+        }
         .zimg-thumb {
             width: 60px;
             height: 60px;
@@ -1351,6 +1596,8 @@
                         </div>
                         <div class="zimg-field"><span class="zimg-label">🎲 Seed</span><input type="number" id="zimg-i2v-seed" class="zimg-input" placeholder="随机" /></div>
                     </div>
+                </div>
+
                 <div class="zimg-panel" id="zimg-panel-speech">
                     <div class="zimg-field">
                         <div class="zimg-label-row">
@@ -1492,10 +1739,21 @@
                 <!-- 历史生成画廊 -->
                 <div class="zimg-field" id="zimg-history-section" style="display:none;">
                     <div class="zimg-label-row">
-                        <span class="zimg-label">🕒 历史生成记录</span>
-                        <span class="zimg-label-sub" style="cursor:pointer;" id="zimg-btn-clear-history">清空记录</span>
+                        <span class="zimg-label">🗂 本地库 <span class="zimg-label-sub" id="zimg-library-count"></span></span>
+                        <span class="zimg-label-sub" style="cursor:pointer;" id="zimg-btn-clear-history">清空本地库</span>
                     </div>
-                    <div class="zimg-history-strip" id="zimg-history-strip"></div>
+                    <div class="zimg-library-controls">
+                        <input type="search" id="zimg-library-search" class="zimg-input" placeholder="搜索提示词、模型或任务 ID" />
+                        <select id="zimg-library-type" class="zimg-input">
+                            <option value="all">全部类型</option>
+                            <option value="image">图片</option>
+                            <option value="video">视频</option>
+                            <option value="audio">音频</option>
+                            <option value="model">3D</option>
+                            <option value="text">文本</option>
+                        </select>
+                    </div>
+                    <div class="zimg-library-grid" id="zimg-history-strip"></div>
                 </div>
             </div>
         </div>
@@ -1607,12 +1865,32 @@
     const historySection = document.getElementById('zimg-history-section');
     const historyStrip = document.getElementById('zimg-history-strip');
     const clearHistoryBtn = document.getElementById('zimg-btn-clear-history');
+    const libraryCount = document.getElementById('zimg-library-count');
+    const librarySearch = document.getElementById('zimg-library-search');
+    const libraryType = document.getElementById('zimg-library-type');
 
     let currentResult = null;
     let currentMode = 'image';
     let activeTaskId = null;
     let activeTaskUrls = null;
     let cancelRequested = false;
+    let currentObjectUrl = '';
+
+    function releaseCurrentObjectUrl() {
+        if (currentObjectUrl) {
+            URL.revokeObjectURL(currentObjectUrl);
+            currentObjectUrl = '';
+        }
+    }
+
+    librarySearch.addEventListener('input', () => {
+        libraryQuery = librarySearch.value.trim().toLowerCase();
+        renderLibrary();
+    });
+    libraryType.addEventListener('change', () => {
+        libraryFilter = libraryType.value;
+        renderLibrary();
+    });
 
     Object.keys(MODEL_REGISTRY).forEach(mode => {
         const select = document.getElementById(`zimg-model-${mode === 'textVideo' ? 'text-video' : mode === 'imageVideo' ? 'image-video' : mode === 'threeD' ? 'three-d' : mode}`);
@@ -1830,57 +2108,276 @@
     bindFileInput('zimg-3d-file', 'zimg-3d-file-label', 'zimg-3d-file-name');
     bindFileInput('zimg-asr-file', 'zimg-asr-file-label', 'zimg-asr-file-name');
 
-    function renderHistory() {
-        if (!historyList || historyList.length === 0) {
-            historySection.style.display = 'none';
-            return;
-        }
-        historyStrip.innerHTML = '';
-        historyList.forEach((item) => {
-            const kind = item.kind || 'image';
-            let thumb;
-            if (kind === 'image') {
-                thumb = document.createElement('img');
-                thumb.className = 'zimg-thumb';
-                thumb.src = item.url;
-            } else {
-                thumb = document.createElement('div');
-                thumb.className = 'zimg-thumb-chip';
-                thumb.textContent = { video: '🎬', audio: '🔊', file: '🧊', text: '💬' }[kind] || '📄';
+    async function getLibraryItem(id) {
+        return withLibrary('readonly', store => store.get(id));
+    }
+
+    async function saveLibraryItem(result, prompt, meta = {}) {
+        const now = Date.now();
+        const kind = result.kind || 'image';
+        const ext = result.ext || extFromUrl(result.url, kind === 'text' ? 'txt' : 'bin');
+        let blob = null;
+        let text = '';
+        let mime = mimeForExt(ext);
+        let localState = 'remote';
+
+        if (kind === 'text') {
+            text = String(result.text || '');
+            blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+            mime = blob.type;
+            localState = 'saved';
+        } else if (result.url) {
+            try {
+                blob = await requestBlob(result.url);
+                mime = blob.type && blob.type !== 'application/octet-stream' ? blob.type : mime;
+                localState = 'saved';
+            } catch (error) {
+                console.warn('[Gitee AI Generator] 结果内容下载失败，保留远程地址', error);
             }
-            thumb.title = item.prompt;
-            thumb.addEventListener('click', () => {
-                promptInput.value = item.prompt;
-                if (kind === 'text') {
-                    showResult({ kind: 'text', text: item.text || '（历史文本内容未保存）', ext: item.ext || 'txt' }, item.prompt);
-                } else {
-                    showResult({ url: item.url, kind, ext: item.ext }, item.prompt);
-                }
-            });
-            historyStrip.appendChild(thumb);
-        });
-        historySection.style.display = 'block';
+        }
+
+        const probed = await probeMedia(blob, kind);
+        const record = {
+            id: `${now.toString(36)}-${hashString(`${result.url || text}|${prompt}|${Math.random()}`)}`,
+            kind,
+            ext,
+            prompt: String(prompt || ''),
+            mode: meta.mode || currentMode,
+            model: meta.model || '',
+            taskId: meta.taskId || '',
+            sourceUrl: result.url || '',
+            filename: result.filename || `gitee-ai-${kind}-${now}.${ext}`,
+            createdAt: now,
+            blob,
+            text,
+            size: blob ? blob.size : 0,
+            mime,
+            width: probed.width,
+            height: probed.height,
+            duration: probed.duration,
+            localState
+        };
+        await withLibrary('readwrite', store => store.put(record));
+        libraryList.unshift(record);
+        renderLibrary();
+        return record.id;
     }
 
-    function addToHistory(result, p) {
-        const entry = { url: result.url, prompt: p, kind: result.kind, ext: result.ext };
-        if (result.kind === 'text') entry.text = String(result.text || '').slice(0, 8000);
-        historyList.unshift(entry);
-        if (historyList.length > 12) historyList.pop();
+    async function migrateLegacyHistory() {
+        let legacyItems = [];
         try {
-            const histStr = JSON.stringify(historyList);
-            safeGM.setValue(STORAGE_HISTORY_KEY, histStr);
-        } catch(e) {}
-        renderHistory();
-    }
+            const raw = safeGM.getValue(STORAGE_HISTORY_KEY, '') || localStorage.getItem(STORAGE_HISTORY_KEY);
+            legacyItems = raw ? JSON.parse(raw) : [];
+        } catch (_) {
+            legacyItems = [];
+        }
+        if (!Array.isArray(legacyItems) || !legacyItems.length) return;
 
-    clearHistoryBtn.addEventListener('click', () => {
+        for (const item of legacyItems) {
+            const kind = (item.kind === 'file' ? 'model' : item.kind) || 'image';
+            const prompt = String(item.prompt || '');
+            const sourceUrl = String(item.url || '');
+            const ext = item.ext || extFromUrl(sourceUrl, kind === 'text' ? 'txt' : 'bin');
+            const record = {
+                id: `legacy-${hashString(`${sourceUrl}|${prompt}|${kind}`)}`,
+                kind,
+                ext,
+                prompt,
+                mode: '',
+                model: '',
+                taskId: '',
+                sourceUrl,
+                filename: `legacy-${Date.now()}.${ext}`,
+                createdAt: Date.now(),
+                blob: null,
+                text: kind === 'text' ? String(item.text || '') : '',
+                size: 0,
+                mime: mimeForExt(ext),
+                width: undefined,
+                height: undefined,
+                duration: undefined,
+                localState: kind === 'text' ? 'saved' : 'remote'
+            };
+            try {
+                await withLibrary('readwrite', store => store.put(record));
+            } catch (error) {
+                console.warn('[Gitee AI Generator] 迁移历史记录失败', error);
+            }
+        }
+
         historyList = [];
         try {
             safeGM.setValue(STORAGE_HISTORY_KEY, '[]');
             localStorage.removeItem(STORAGE_HISTORY_KEY);
-        } catch(e) {}
-        renderHistory();
+        } catch (_) {}
+    }
+
+    function initLibrary() {
+        if (libraryInitPromise) return libraryInitPromise;
+        libraryInitPromise = (async () => {
+            await openLibrary();
+            await migrateLegacyHistory();
+            await refreshLibrary();
+        })();
+        libraryInitPromise.catch(error => {
+            console.warn('[Gitee AI Generator] 本地库初始化失败', error);
+        });
+        return libraryInitPromise;
+    }
+
+    async function refreshLibrary() {
+        const items = await withLibrary('readonly', store => store.getAll());
+        libraryList = (items || []).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        renderLibrary();
+    }
+
+    function libraryMatches(item) {
+        if (libraryFilter !== 'all' && item.kind !== libraryFilter) return false;
+        if (!libraryQuery) return true;
+        const haystack = [
+            item.prompt,
+            item.model,
+            item.mode,
+            item.taskId,
+            item.filename,
+            item.sourceUrl,
+            item.ext,
+            item.text
+        ].filter(Boolean).join('\n').toLowerCase();
+        return haystack.includes(libraryQuery);
+    }
+
+    function renderLibrary() {
+        libraryObjectUrls.forEach(url => URL.revokeObjectURL(url));
+        libraryObjectUrls = [];
+        if (!libraryList.length) {
+            historySection.style.display = 'none';
+            return;
+        }
+        historySection.style.display = 'block';
+        const items = libraryList.filter(libraryMatches);
+        libraryCount.textContent = `${items.length} / ${libraryList.length}`;
+        historyStrip.innerHTML = '';
+        if (!items.length) {
+            const empty = document.createElement('div');
+            empty.className = 'zimg-library-empty';
+            empty.textContent = '没有匹配的生成内容';
+            historyStrip.appendChild(empty);
+            return;
+        }
+
+        const kindLabels = { image: '图片', video: '视频', audio: '音频', model: '3D', text: '文本' };
+        items.forEach((item) => {
+            const card = document.createElement('div');
+            card.className = 'zimg-library-item';
+            card.title = [
+                item.prompt || '(无提示词)',
+                `类型：${kindLabels[item.kind] || item.kind}`,
+                item.model ? `模型：${item.model}` : '',
+                item.size ? `大小：${formatBytes(item.size)}` : '',
+                item.width ? `尺寸：${item.width}×${item.height}` : '',
+                item.duration ? `时长：${item.duration}s` : ''
+            ].filter(Boolean).join('\n');
+
+            if (item.kind === 'image') {
+                const thumb = document.createElement('img');
+                thumb.alt = item.prompt || '本地生成图片';
+                if (item.blob) {
+                    const objectUrl = URL.createObjectURL(item.blob);
+                    libraryObjectUrls.push(objectUrl);
+                    thumb.src = objectUrl;
+                } else {
+                    thumb.src = item.sourceUrl;
+                }
+                card.appendChild(thumb);
+            } else {
+                const chip = document.createElement('div');
+                chip.className = 'zimg-library-chip';
+                chip.textContent = { video: '🎬', audio: '🔊', model: '🧊', text: '💬' }[item.kind] || '📄';
+                card.appendChild(chip);
+            }
+
+            const badge = document.createElement('span');
+            badge.className = 'zimg-library-badge';
+            badge.textContent = `${kindLabels[item.kind] || item.kind}${item.localState === 'remote' ? ' · 远程' : ''}`;
+            const deleteBtn = document.createElement('button');
+            deleteBtn.type = 'button';
+            deleteBtn.className = 'zimg-library-delete';
+            deleteBtn.textContent = '✕';
+            deleteBtn.title = '删除这条本地记录';
+            deleteBtn.setAttribute('aria-label', '删除这条本地记录');
+            deleteBtn.addEventListener('click', event => {
+                event.stopPropagation();
+                deleteLibraryItem(item.id);
+            });
+            card.addEventListener('click', () => openLibraryItem(item.id));
+            card.append(badge, deleteBtn);
+            historyStrip.appendChild(card);
+        });
+    }
+
+    async function openLibraryItem(id) {
+        try {
+            const item = await getLibraryItem(id);
+            if (!item) {
+                await refreshLibrary();
+                return;
+            }
+            let objectUrl = '';
+            let result;
+            if (item.kind === 'text') {
+                result = { kind: 'text', text: item.text || '', ext: item.ext || 'txt' };
+            } else if (item.blob) {
+                releaseCurrentObjectUrl();
+                objectUrl = URL.createObjectURL(item.blob);
+                result = { url: objectUrl, kind: item.kind, ext: item.ext, filename: item.filename };
+            } else {
+                result = { url: item.sourceUrl, kind: item.kind, ext: item.ext, filename: item.filename };
+            }
+            result.sourceUrl = item.sourceUrl || '';
+            showResult(result, item.prompt);
+            currentObjectUrl = objectUrl;
+            promptInput.value = item.prompt || '';
+        } catch (error) {
+            console.error('[Gitee AI Generator] 打开本地库内容失败', error);
+            showStatus('error', `❌ 本地内容打开失败：${error.message}`);
+        }
+    }
+
+    async function deleteLibraryItem(id) {
+        try {
+            await withLibrary('readwrite', store => store.delete(id));
+            await refreshLibrary();
+            showStatus('success', '🗑 已删除这条本地记录');
+            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 1500);
+        } catch (error) {
+            console.error('[Gitee AI Generator] 删除本地库内容失败', error);
+            showStatus('error', `❌ 删除失败：${error.message}`);
+        }
+    }
+
+    async function addToHistory(result, p, meta = {}) {
+        try {
+            await saveLibraryItem(result, p, meta);
+        } catch (error) {
+            console.warn('[Gitee AI Generator] 本地库保存失败，仅保留远程结果', error);
+        }
+    }
+
+    clearHistoryBtn.addEventListener('click', async () => {
+        if (!confirm(`确定清空本地库中的 ${libraryList.length} 条生成内容？此操作不可恢复。`)) return;
+        try {
+            await withLibrary('readwrite', store => store.clear());
+            historyList = [];
+            safeGM.setValue(STORAGE_HISTORY_KEY, '[]');
+            localStorage.removeItem(STORAGE_HISTORY_KEY);
+            await refreshLibrary();
+            showStatus('success', '🧹 本地库已清空');
+            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 1500);
+        } catch (error) {
+            console.error('[Gitee AI Generator] 清空本地库失败', error);
+            showStatus('error', `❌ 本地库清空失败：${error.message}`);
+        }
     });
 
     function extFromUrl(url, fallback) {
@@ -1904,6 +2401,7 @@
     }
 
     function showResult(result, prompt) {
+        releaseCurrentObjectUrl();
         currentResult = result;
         hideResultMedia();
         if (result.kind === 'image') {
@@ -1931,7 +2429,7 @@
         overlay.style.display = 'flex';
         switchMode(currentMode);
         refreshToken(false);
-        renderHistory();
+        initLibrary();
         updateQuotaDisplay();
     }
     function closeModal() {
@@ -2746,16 +3244,31 @@
             const created = await requestJson({ method: request.method, url: request.url, headers: request.headers, data: request.body });
             if (created.status < 200 || created.status >= 300) throw new Error(requestErrorMessage(created.status, created.data, created.data && created.data.raw));
             const taskId = created.data.task_id || (created.data.data && created.data.data.task_id);
+            const consoleMeta = {
+                mode: 'console',
+                model: operation ? D(operation.model) : '',
+                taskId: taskId || ''
+            };
             if (request.isAsync && taskId) {
                 activeTaskId = taskId;
                 activeTaskUrls = created.data.urls || created.data.task_urls || null;
                 state.textContent = `任务已提交：${taskId}`;
                 const resultUrl = await pollTask(taskId, cleanToken(tokenInput.value), '');
                 const extracted = extractConsoleResult(created.data) || resultUrl;
-                showResult({ url: extracted, kind: mediaKind(extracted, 'console'), ext: extFromUrl(extracted, 'bin') }, '控制台任务');
+                currentResult = { url: extracted, kind: mediaKind(extracted, 'console'), ext: extFromUrl(extracted, 'bin') };
+                showResult(currentResult, '控制台任务');
+                addToHistory(currentResult, '控制台任务', consoleMeta);
             } else {
                 const extracted = extractConsoleResult(created.data);
-                if (extracted && /^(https?:|data:)/.test(extracted)) showResult({ url: extracted, kind: mediaKind(extracted, 'console'), ext: extFromUrl(extracted, 'bin') }, '控制台结果');
+                if (extracted) {
+                    if (/^(https?:|data:)/.test(extracted)) {
+                        currentResult = { url: extracted, kind: mediaKind(extracted, 'console'), ext: extFromUrl(extracted, 'bin') };
+                    } else {
+                        currentResult = { kind: 'text', text: String(extracted), ext: 'txt' };
+                    }
+                    showResult(currentResult, '控制台结果');
+                    addToHistory(currentResult, '控制台结果', consoleMeta);
+                }
             }
             document.getElementById('zimg-console-response').value = JSON.stringify(created.data, null, 2);
             state.textContent = `成功：HTTP ${created.status}`;
@@ -3167,7 +3680,11 @@
         const url = await pollTask(taskId, token, prompt);
         const kind = mediaKind(url, currentMode);
         showResult({ url, kind, ext: extFromUrl(url, { video: 'mp4', audio: 'mpeg', model: 'glb' }[kind] || 'bin') }, prompt);
-        addToHistory(currentResult, prompt);
+        addToHistory(currentResult, prompt, {
+            mode: currentMode,
+            model: getModeSelect(currentMode).value,
+            taskId
+        });
     }
 
     async function doGenerate() {
@@ -3200,7 +3717,11 @@
                 const quota = consumeOneQuota();
                 updateQuotaDisplay(quota);
                 showResult(currentResult, prompt);
-                addToHistory(currentResult, prompt);
+                addToHistory(currentResult, prompt, {
+                    mode: 'image',
+                    model: getModeSelect('image').value,
+                    taskId: activeTaskId
+                });
             } else if (currentMode === 'textVideo') {
                 const prompt = requirePrompt();
                 await runJsonGeneration(ENDPOINTS.textVideo, buildTextVideoPayload(prompt), prompt, token);
@@ -3227,7 +3748,11 @@
                 const url = await pollTask(activeTaskId, token, prompt);
                 currentResult = { url, kind: 'video', ext: extFromUrl(url, 'mp4') };
                 showResult(currentResult, prompt);
-                addToHistory(currentResult, prompt);
+                addToHistory(currentResult, prompt, {
+                    mode: 'imageVideo',
+                    model: getModeSelect('imageVideo').value,
+                    taskId: activeTaskId
+                });
             } else if (currentMode === 'threeD') {
                 const file = requireFile('zimg-3d-file');
                 const created = await requestJson({
@@ -3247,7 +3772,11 @@
                 const url = await pollTask(activeTaskId, token, '');
                 currentResult = { url, kind: 'model', ext: extFromUrl(url, 'glb'), filename: `model-${Date.now()}.${extFromUrl(url, 'glb')}` };
                 showResult(currentResult, '');
-                addToHistory(currentResult, `${getModeSelect('threeD').value} 3D 模型`);
+                addToHistory(currentResult, `${getModeSelect('threeD').value} 3D 模型`, {
+                    mode: 'threeD',
+                    model: getModeSelect('threeD').value,
+                    taskId: activeTaskId
+                });
             } else if (currentMode === 'chat') {
                 const userMsg = requirePrompt();
                 const payload = buildChatPayload(userMsg);
@@ -3279,7 +3808,11 @@
                 updateChatStateLabel();
                 currentResult = { kind: 'text', text: content, ext: 'txt' };
                 showResult(currentResult, userMsg);
-                addToHistory(currentResult, userMsg);
+                addToHistory(currentResult, userMsg, {
+                    mode: 'chat',
+                    model: getModeSelect('chat').value,
+                    taskId: activeTaskId
+                });
             } else if (currentMode === 'asr') {
                 const file = requireFile('zimg-asr-file');
                 generatePhase = '上传音频并识别中';
@@ -3297,7 +3830,11 @@
                 if (!text) throw new Error('接口未返回识别文本');
                 currentResult = { kind: 'text', text, ext: 'txt' };
                 showResult(currentResult, `语音识别：${file.name}`);
-                addToHistory(currentResult, `🎙 ${file.name}`);
+                addToHistory(currentResult, `🎙 ${file.name}`, {
+                    mode: 'asr',
+                    model: getModeSelect('asr').value,
+                    taskId: activeTaskId
+                });
             }
             const totalTime = ((Date.now() - generateStartTime) / 1000).toFixed(1);
             showStatus('success', `🎉 生成成功（耗时 ${totalTime}s）`);
@@ -3352,7 +3889,8 @@
     copyLinkBtn.addEventListener('click', () => {
         if (!currentResult) return;
         const isText = currentResult.kind === 'text';
-        navigator.clipboard.writeText(isText ? currentResult.text : currentResult.url).then(() => {
+        const copyValue = isText ? currentResult.text : (currentResult.sourceUrl || currentResult.url);
+        navigator.clipboard.writeText(copyValue).then(() => {
             showStatus('success', isText ? '✅ 文本内容已复制到剪贴板' : '✅ 结果链接已复制到剪贴板');
             setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2000);
         }).catch(err => {
