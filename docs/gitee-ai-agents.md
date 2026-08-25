@@ -67,7 +67,7 @@ curl https://ai.gitee.com/v1/images/generations \
   }'
 ```
 
-可调参数：`size`(如 1024x1024 / 1536x864 / **3840x2160** / **2160x3840**)、`width`/`height`、`num_inference_steps`、`negative_prompt`、`guidance_scale`、`seed`、`num_images_per_prompt`、`response_format`(`url` 或 `b64_json`)。最高可传 4K；个别模型对超大尺寸或特定比例可能拒绝请求。
+可调参数：`size`(常用 `1024x1024` / `1536x864`)、`width`/`height`、`num_inference_steps`、`negative_prompt`、`guidance_scale`、`seed`、`num_images_per_prompt`、`response_format`(`url` 或 `b64_json`)。分辨率和枚举以所选模型元数据为准；个别模型可能提供 4K 档。
 响应：`data[0].url` 或 `data[0].b64_json`；`b64_json` 数据量大，除非要离线保存，优先用 `url`。
 
 ### 1.3 语音识别（🆓 全部免费）— `POST /v1/audio/transcriptions`
@@ -92,13 +92,13 @@ curl https://ai.gitee.com/v1/audio/transcriptions \
 
 ```json
 {"task_id": "SBOMLX0YXU8SVJQXY6CNWVJ7OJAND5TK", "status": "waiting", "created_at": 1787474128023,
- "urls": {"get": "https://ai.gitee.com/api/v1/task/SBOM...", "cancel": "https://ai.gitee.com/api/v1/task/SBOM.../cancel"}}
+ "urls": {"get": "https://ai.gitee.com/v1/task/SBOM...", "cancel": "https://ai.gitee.com/v1/task/SBOM.../cancel"}}
 ```
 
 2. 携带同一认证头轮询任务状态（每 4 秒一次，最长 15 分钟）：
 
 ```bash
-curl https://ai.gitee.com/api/v1/task/$TASK_ID -H "Authorization: Bearer $TOKEN"
+curl https://ai.gitee.com/v1/task/$TASK_ID -H "Authorization: Bearer $TOKEN"
 ```
 
 3. 响应中的 `status` 字段状态机：
@@ -106,7 +106,7 @@ curl https://ai.gitee.com/api/v1/task/$TASK_ID -H "Authorization: Bearer $TOKEN"
    - `failed` / `cancelled` → 终态失败，原因在 `message` 字段，据此修正参数后可重新提交一次；
    - 其它取值（如 `waiting`）→ 仍在排队 / 处理中，继续轮询，不要提前放弃。
 
-4. 需要中止时：`POST /api/v1/task/{task_id}/cancel`。
+4. 需要中止时：优先使用提交响应里的 `urls.cancel`，否则使用 `POST /v1/task/{task_id}/cancel`。
 
 ### 2.1 文生视频 — `POST /v1/async/videos/generations`
 
@@ -118,7 +118,7 @@ JSON 参数：`model`、`prompt`、`num_frames`(如 81)、`num_inference_steps`�
 
 模型：`LTX-2`、`Wan2_2-I2V-A14B`
 
-multipart 参数：`model`、`image`(图片文件)、`prompt`、`num_frames`、`width`、`height`、`num_inference_steps`、`fps`、`guidance_scale`、`seed`、`negative_prompt`。常用分辨率：1280x720、1920x1080、3840x2160（4K 横屏）、2160x3840（4K 竖屏）；实际输出受所选模型限制。
+multipart 参数：`model`、`image`(图片文件)、`prompt`、`num_frames`、`width`、`height`、`num_inference_steps`、`fps`、`guidance_scale`、`seed`、`negative_prompt`。常见宽度/高度上限为 2048；帧数、步数和 fps 以模型元数据为准。
 
 ### 2.3 语音合成（🆓 免费）— `POST /v1/async/audio/speech`
 
@@ -145,7 +145,7 @@ curl https://ai.gitee.com/v1/async/audio/speech \
 模型：`Hunyuan3D-2`、`Hi3DGen`
 
 multipart 参数：`model`、`image`、`seed`、`file_format`(`glb`/`stl`)。
-Hunyuan3D-2 追加：`type`、`num_inference_steps`(1-20)、`octree_resolution`(64/128/256)、`guidance_scale`、`texture`(`true`/`false`)、`foreground_detection`、`mc_resolution`(默认 512)、`face_count`(默认 80000)。
+Hunyuan3D-2 追加：`type`、`num_inference_steps`(2-50)、`octree_resolution`(16/64/128/256/400)、`guidance_scale`、`texture`(`true`/`false`)、`foreground_detection`、`mc_resolution`(默认 512)、`face_count`(默认 80000)。
 
 ## 3. Agent 行为约定
 
@@ -167,7 +167,7 @@ Hunyuan3D-2 追加：`type`、`num_inference_steps`(1-20)、`octree_resolution`(
 | 语音合成 | `POST /v1/async/audio/speech` | 异步 | 🆓 免费 |
 | 图片转 3D | `POST /v1/async/image-to-3d` | 异步 | 付费 |
 | 文生图（大图异步） | `POST /v1/async/images/generations` | 异步 | 付费 |
-| 任务轮询 | `GET /api/v1/task/{task_id}` | — | — |
-| 取消任务 | `POST /api/v1/task/{task_id}/cancel` | — | — |
+| 任务轮询 | `GET /v1/task/{task_id}` | — | — |
+| 取消任务 | `POST /v1/task/{task_id}/cancel` | — | — |
 
 另有一些平台已知端点（人脸迁移 `/v1/images/face-migration`、文转 3D `/v1/async/text-to-3d`、文档解析 `/v1/async/documents/parse` 等），本文档未展开；使用前先向使用者确认需求与费用。

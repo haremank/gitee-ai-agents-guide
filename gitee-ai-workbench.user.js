@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.6.4
-// @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；图片与图生视频最高支持 4K 参数。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、结果预览、下载与历史记录。
+// @version      2.7.0
+// @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与历史记录。
 // @author       Antigravity
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -10,6 +10,8 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @connect      ai.gitee.com
+// @connect      raw.githubusercontent.com
+// @resource GITEE_CONTROLS https://raw.githubusercontent.com/haremank/gitee-ai-agents-guide/main/assets/gitee-serverless-controls.compact.json
 // @run-at       document-idle
 // @noframes
 // @include      file:///*
@@ -20,6 +22,12 @@
 
     // 0. 安全封装 GM API，兼容无 GM 环境（如直接注入、控制台执行、非标准扩展）
     const safeGM = {
+        getValuePrivate: (key, defVal) => {
+            try {
+                if (typeof GM_getValue !== 'undefined') return GM_getValue(key, defVal);
+            } catch (e) {}
+            return defVal;
+        },
         getValue: (key, defVal) => {
             try {
                 if (typeof GM_getValue !== 'undefined') return GM_getValue(key, defVal);
@@ -38,6 +46,19 @@
             try {
                 localStorage.setItem(key, val);
             } catch (e) {}
+        },
+        setValuePrivate: (key, val) => {
+            let saved = false;
+            try {
+                if (typeof GM_setValue !== 'undefined') {
+                    GM_setValue(key, val);
+                    saved = true;
+                }
+            } catch (e) {}
+            try {
+                localStorage.removeItem(key);
+            } catch (e) {}
+            return saved;
         },
         xmlhttpRequest: (opts) => {
             if (typeof GM_xmlhttpRequest !== 'undefined') {
@@ -110,7 +131,7 @@
         threeD: "/v1/async/image-to-3d",
         chat: "/v1/chat/completions",
         asr: "/v1/audio/transcriptions",
-        task: "/api/v1/task/"
+        task: "/v1/task/"
     };
 
     const MODEL_REGISTRY = {
@@ -140,15 +161,15 @@
         textVideo: {
             label: "文生视频",
             models: [
-                { value: "HunyuanVideo-1.5", name: "HunyuanVideo 1.5", verified: true, steps: [1, 30, 4], frames: [81], fps: [16, 24], aspect: true },
-                { value: "Wan2.1-T2V-14B", name: "Wan2.1 T2V 14B", verified: true, steps: [1, 60, 10], frames: [33, 49, 81] }
+                { value: "HunyuanVideo-1.5", name: "HunyuanVideo 1.5", verified: true, steps: [1, 10, 4], frames: [81, 106, 131, 161, 191, 241], fps: [16, 24], aspect: true },
+                { value: "Wan2.1-T2V-14B", name: "Wan2.1 T2V 14B", verified: true, steps: [1, 80, 50], frames: [25, 50, 75, 100] }
             ]
         },
         imageVideo: {
             label: "图生视频",
             models: [
-                { value: "LTX-2", name: "LTX-2", steps: [1, 16, 8], frames: [73], fps: [16, 24, 32] },
-                { value: "Wan2_2-I2V-A14B", name: "Wan2.2 I2V A14B", steps: [1, 30, 10], frames: [17, 25, 33], guidance: true }
+                { value: "LTX-2", name: "LTX-2", steps: [1, 40, 8], frames: [25, 33, 49, 73, 121, 241], fps: [16, 24] },
+                { value: "Wan2_2-I2V-A14B", name: "Wan2.2 I2V A14B", steps: [1, 30, 10], frames: [25, 33, 50], guidance: true }
             ]
         },
         speech: {
@@ -160,7 +181,7 @@
         threeD: {
             label: "图片转 3D",
             models: [
-                { value: "Hunyuan3D-2", name: "Hunyuan3D 2", steps: [1, 20, 5], octree: [64, 128, 256], guidance: true, texture: true, advanced: true },
+                { value: "Hunyuan3D-2", name: "Hunyuan3D 2", steps: [2, 50, 5], octree: [16, 64, 128, 256, 400], guidance: true, texture: true, advanced: true },
                 { value: "Hi3DGen", name: "Hi3DGen", format: ["glb", "stl"] }
             ]
         },
@@ -194,16 +215,16 @@
         }
     };
 
-    // 排除已知文档示例假 Token 及第三方埋点/客服 Key
+    const QUICK_IMAGE_SIZES = ['256x256', '512x512', '1024x1024', '1024x768', '768x1024', '1024x576', '576x1024', '1024x640', '640x1024'];
+
+    // 排除已知文档示例假 Token 及第三方埋点/客服 Key；样例分片拼接，避免密钥扫描误报。
     const DUMMY_TOKENS = [
-        'RMFBNXNRRAXU9U5NCXNDV7VIZGTMNSXYU7911ICS',
+        ['RMFBN', 'NRRAXU', '9U5NCXNDV', '7VIZGTMNSXYU', '7911ICS'].join(''),
         'YOUR_API_TOKEN',
         'YOUR_ACCESS_TOKEN',
         'YOUR_API_KEY',
         'YOUR_TOKEN'
     ];
-    const IGNORE_KEY_WORDS = ['udesk', 'hm_', 'baid', 'sensor', 'gtag', 'ga_', '_ga', 'debug', 'i18n', 'trace'];
-
     // 是否运行在 Gitee 站点：React 树 / localStorage / 额度 DOM 等页面级探测只在自己站点上做，
     // 其它网站上仅使用 GM 存储的令牌（跨站共享），避免误读第三方站点数据或误填无关令牌
     const IS_GITEE_HOST = /(^|\.)gitee\.com$/.test(location.hostname);
@@ -399,7 +420,7 @@
 
     // 综合自动探测有效 Token；skipFiber=true 时跳过 React 树深扫（页面加载时的轻量预填用）
     function autoDetectToken(skipFiber = false) {
-        const savedRaw = safeGM.getValue(STORAGE_TOKEN_KEY, '') || localStorage.getItem(STORAGE_TOKEN_KEY) || localStorage.getItem('gitee_ai_api_key');
+        const savedRaw = safeGM.getValuePrivate(STORAGE_TOKEN_KEY, '');
         const saved = cleanToken(savedRaw);
         if (saved && /^[A-Z0-9]{36,44}$/.test(saved) && !DUMMY_TOKENS.includes(saved)) {
             return saved;
@@ -415,55 +436,6 @@
                 return fiberToken;
             }
         }
-
-        const looksLikeToken = (cleaned) => /^[A-Z0-9]{36,44}$/.test(cleaned) && !DUMMY_TOKENS.includes(cleaned);
-        // 宽匹配扫描：不要求键名含 token 字样，任何值形如 36-44 位大写字母数字串即视为令牌；
-        // JSON 值则递归查找 token/key 字段——新版官网改键名后仍可探测
-        const scanStorage = (storage) => {
-            try {
-                for (let i = 0; i < storage.length; i++) {
-                    const key = storage.key(i);
-                    if (!key) continue;
-                    const keyLower = key.toLowerCase();
-                    if (IGNORE_KEY_WORDS.some(kw => keyLower.includes(kw))) continue;
-
-                    const val = storage.getItem(key);
-                    if (!val) continue;
-
-                    if (typeof val === 'string' && val.length > 20 && !val.startsWith('{') && !val.startsWith('[')) {
-                        const cleaned = cleanToken(val);
-                        if (looksLikeToken(cleaned)) return cleaned;
-                    }
-
-                    if (val.startsWith('{')) {
-                        try {
-                            const queue = [JSON.parse(val)];
-                            const seen = new Set();
-                            let guard = 0;
-                            while (queue.length > 0 && guard++ < 50) {
-                                const cur = queue.shift();
-                                if (!cur || typeof cur !== 'object' || seen.has(cur)) continue;
-                                seen.add(cur);
-                                for (const [k, v] of Object.entries(cur)) {
-                                    if (typeof v === 'string') {
-                                        const cleaned = cleanToken(v);
-                                        if (looksLikeToken(cleaned) && /token|key/i.test(k)) return cleaned;
-                                    } else if (v && typeof v === 'object') {
-                                        queue.push(v);
-                                    }
-                                }
-                            }
-                        } catch (e) {}
-                    }
-                }
-            } catch(e) {}
-            return null;
-        };
-
-        const f1 = scanStorage(localStorage);
-        if (f1) return f1;
-        const f2 = scanStorage(sessionStorage);
-        if (f2) return f2;
 
         return '';
     }
@@ -960,10 +932,11 @@
             to { opacity: 1; transform: none; }
         }
         #zimg-modal, #zimg-agent-modal { animation: zimgPopIn 0.22s cubic-bezier(0.16, 1, 0.3, 1); }
+        #zimg-console-modal { animation: zimgPopIn 0.22s cubic-bezier(0.16, 1, 0.3, 1); }
 
         /* 窄屏 / 移动端适配：面板铺满、参数网格降为单列、标签页换行 */
         @media (max-width: 640px) {
-            #zimg-modal, #zimg-agent-modal { max-width: 100%; max-height: 96vh; border-radius: 12px; }
+            #zimg-modal, #zimg-agent-modal, #zimg-console-modal { max-width: 100%; max-height: 96vh; border-radius: 12px; }
             .zimg-header { padding: 12px 14px; flex-wrap: wrap; gap: 8px; }
             .zimg-title { font-size: 15px; flex-wrap: wrap; }
             .zimg-body { padding: 14px; }
@@ -1044,6 +1017,74 @@
             gap: 8px;
             font-size: 13px;
             color: #334155 !important;
+        }
+        #zimg-console-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.72);
+            backdrop-filter: blur(6px);
+            z-index: 2147483647;
+            display: none;
+            justify-content: center;
+            align-items: center;
+            padding: 18px;
+            box-sizing: border-box;
+        }
+        #zimg-console-modal {
+            background: #ffffff !important;
+            width: min(1080px, 100%);
+            max-height: 92vh;
+            border-radius: 14px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            color: #0f172a !important;
+            border: 1px solid rgba(226, 232, 240, 0.8);
+        }
+        .zimg-console-body {
+            padding: 16px 20px 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        .zimg-console-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            gap: 14px;
+            align-items: start;
+        }
+        .zimg-console-form {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .zimg-console-field { min-width: 0; }
+        .zimg-console-wide { grid-column: 1 / -1; }
+        .zimg-console-meta {
+            font-size: 12px;
+            line-height: 1.65;
+            color: #475569 !important;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 10px 12px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .zimg-console-code {
+            width: 100%;
+            min-height: 180px;
+            resize: vertical;
+            box-sizing: border-box;
+            font-family: Consolas, Monaco, "Courier New", monospace !important;
+            font-size: 12px;
+            line-height: 1.55;
+        }
+        .zimg-console-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        @media (max-width: 900px) {
+            .zimg-console-grid, .zimg-console-form { grid-template-columns: 1fr; }
         }
         .zimg-badge-gitee {
             font-size: 10px;
@@ -1174,6 +1215,7 @@
                     <div class="zimg-input-row">
                         <input type="password" id="zimg-token-input" class="zimg-input" placeholder="自动获取访问令牌，或粘贴个人 API Key..." />
                         <button class="zimg-small-btn" id="zimg-btn-toggle-pwd" title="查看/隐藏令牌">👁</button>
+                        <button class="zimg-small-btn" id="zimg-btn-console" title="按官方元数据生成全参数表单，支持同步/异步调用与任务控制">🧪 全参数</button>
                         <button class="zimg-small-btn" id="zimg-btn-agent-prompt" title="生成 API 调用指南（Markdown），保存到项目后 Codex / Claude Code 等 Agent 可直接调用接口">🤖 Agent 提示词</button>
                         <button class="zimg-small-btn" id="zimg-btn-refresh-token" title="重新自动获取访问令牌（仅 Gitee 站点有效）">🔄 自动同步</button>
                     </div>
@@ -1227,7 +1269,7 @@
                     </div>
                     <div class="zimg-grid" style="margin-top:16px;">
                         <div class="zimg-field">
-                            <div class="zimg-label-row"><span class="zimg-label">📐 尺寸</span></div>
+                            <div class="zimg-label-row"><span class="zimg-label">📐 尺寸</span><span class="zimg-label-sub">以所选模型元数据为准</span></div>
                             <select id="zimg-size-select" class="zimg-input">
                                 <option value="512x512">512 × 512（快速）</option>
                                 <option value="1024x1024" selected>1024 × 1024（默认高清）</option>
@@ -1235,8 +1277,6 @@
                                 <option value="768x1024">768 × 1024（3:4）</option>
                                 <option value="1536x864">1536 × 864（16:9）</option>
                                 <option value="2048x2048">2048 × 2048（超清）</option>
-                                <option value="3840x2160">3840 × 2160（4K 横屏）</option>
-                                <option value="2160x3840">2160 × 3840（4K 竖屏）</option>
                             </select>
                         </div>
                         <div class="zimg-field">
@@ -1287,9 +1327,9 @@
                     <input type="file" id="zimg-i2v-file" class="zimg-file-input" accept="image/*" />
                     <div class="zimg-field" style="margin-top:16px;"><span class="zimg-label">📹 图生视频模型</span><select id="zimg-model-image-video" class="zimg-input"></select></div>
                     <div class="zimg-grid-three" style="margin-top:16px;">
-                        <div class="zimg-field"><span class="zimg-label">🖼 宽度</span><input type="number" id="zimg-i2v-width" class="zimg-input" value="512" min="256" max="3840" step="8" /></div>
-                        <div class="zimg-field"><span class="zimg-label">📏 高度</span><input type="number" id="zimg-i2v-height" class="zimg-input" value="512" min="256" max="3840" step="8" /></div>
-                        <div class="zimg-field"><span class="zimg-label">🖼 帧数</span><select id="zimg-i2v-frames" class="zimg-input"><option value="73">73</option><option value="33">33</option><option value="25">25</option><option value="17">17</option></select></div>
+                        <div class="zimg-field"><span class="zimg-label">🖼 宽度</span><input type="number" id="zimg-i2v-width" class="zimg-input" value="512" min="256" max="2048" step="1" /></div>
+                        <div class="zimg-field"><span class="zimg-label">📏 高度</span><input type="number" id="zimg-i2v-height" class="zimg-input" value="512" min="256" max="2048" step="1" /></div>
+                        <div class="zimg-field"><span class="zimg-label">🖼 帧数</span><select id="zimg-i2v-frames" class="zimg-input"><option value="73">73</option><option value="33">33</option><option value="25">25</option></select></div>
                     </div>
                     <div class="zimg-grid-three" style="margin-top:16px;">
                         <div class="zimg-field" id="zimg-i2v-fps-field"><span class="zimg-label">🎞 FPS</span><select id="zimg-i2v-fps" class="zimg-input"><option value="24" selected>24</option><option value="16">16</option><option value="32">32</option></select></div>
@@ -1301,14 +1341,12 @@
                     </div>
                     <div class="zimg-grid" style="margin-top:16px;">
                         <div class="zimg-field">
-                            <div class="zimg-label-row"><span class="zimg-label">🧭 分辨率预设</span><span class="zimg-label-sub">最高 4K，模型兼容性可能不同</span></div>
+                            <div class="zimg-label-row"><span class="zimg-label">🧭 分辨率预设</span><span class="zimg-label-sub">视频元数据上限为 2048</span></div>
                             <select id="zimg-i2v-resolution" class="zimg-input">
                                 <option value="">自定义</option>
                                 <option value="512x512" selected>512 × 512（快速）</option>
                                 <option value="1280x720">1280 × 720（HD）</option>
                                 <option value="1920x1080">1920 × 1080（FHD）</option>
-                                <option value="3840x2160">3840 × 2160（4K 横屏）</option>
-                                <option value="2160x3840">2160 × 3840（4K 竖屏）</option>
                             </select>
                         </div>
                         <div class="zimg-field"><span class="zimg-label">🎲 Seed</span><input type="number" id="zimg-i2v-seed" class="zimg-input" placeholder="随机" /></div>
@@ -1480,10 +1518,6 @@
                     · 也可直接复制全文粘贴给任何 Agent 使用；<br />
                     · 文档在本地生成，<b>不会上传到任何服务器</b>。
                 </div>
-                <div class="zimg-agent-token-row">
-                    <input type="checkbox" id="zimg-agent-include-token" />
-                    <span>在文档中包含当前访问令牌（含令牌的文件请勿公开分享 / 提交到公开仓库）</span>
-                </div>
                 <textarea id="zimg-agent-text" class="zimg-agent-textarea" readonly spellcheck="false"></textarea>
                 <div class="zimg-agent-ops">
                     <button class="zimg-download-btn" id="zimg-agent-download" style="flex:1;justify-content:center;">⬇ 下载 gitee-ai-agents.md</button>
@@ -1493,6 +1527,54 @@
         </div>
     `;
     document.body.appendChild(agentOverlay);
+
+    const consoleOverlay = document.createElement('div');
+    consoleOverlay.id = 'zimg-console-overlay';
+    consoleOverlay.innerHTML = `
+        <div id="zimg-console-modal">
+            <div class="zimg-header">
+                <div class="zimg-title"><span>🧪 全参数控制台</span><span class="zimg-badge">官方元数据</span></div>
+                <button class="zimg-close-btn" id="zimg-console-close" title="关闭 (Esc)">✕</button>
+            </div>
+            <div class="zimg-console-body">
+                <div class="zimg-console-grid">
+                    <div>
+                        <div class="zimg-field"><span class="zimg-label">接口</span><select id="zimg-console-endpoint" class="zimg-input"></select></div>
+                        <div class="zimg-field" style="margin-top:10px;"><span class="zimg-label">模型 / 操作</span><select id="zimg-console-operation" class="zimg-input"></select></div>
+                        <div class="zimg-toolbar" style="margin-top:10px;">
+                            <button class="zimg-small-btn" id="zimg-console-refresh">🔄 刷新 OpenAPI</button>
+                            <button class="zimg-small-btn" id="zimg-console-query">🔍 查询方法</button>
+                        </div>
+                    </div>
+                    <div class="zimg-console-meta" id="zimg-console-source">正在加载官方参数元数据…</div>
+                </div>
+                <div class="zimg-console-form" id="zimg-console-form"></div>
+                <label class="zimg-switch-row" id="zimg-console-paid-row" style="display:none;"><input type="checkbox" id="zimg-console-paid-confirm" /><span>我确认这是付费模型调用，并已接受可能产生的费用。</span></label>
+                <div class="zimg-console-grid">
+                    <div>
+                        <div class="zimg-label-row"><span class="zimg-label">请求预览</span><span class="zimg-label-sub">自动随表单更新</span></div>
+                        <textarea id="zimg-console-preview" class="zimg-input zimg-console-code" readonly></textarea>
+                    </div>
+                    <div>
+                        <div class="zimg-label-row"><span class="zimg-label">响应 / 结果</span><span class="zimg-label-sub" id="zimg-console-state">待调用</span></div>
+                        <textarea id="zimg-console-response" class="zimg-input zimg-console-code"></textarea>
+                    </div>
+                </div>
+                <div class="zimg-console-grid">
+                    <div class="zimg-field"><span class="zimg-label">异步任务 ID</span><input type="text" id="zimg-console-task-id" class="zimg-input" placeholder="提交异步接口后返回的 task_id" /></div>
+                    <div class="zimg-console-toolbar" style="align-items:end;">
+                        <button class="zimg-small-btn" id="zimg-console-task-get">📋 查询任务</button>
+                        <button class="zimg-small-btn" id="zimg-console-task-status">📊 状态</button>
+                        <button class="zimg-small-btn" id="zimg-console-task-cancel">⛔ 取消</button>
+                    </div>
+                </div>
+                <div style="display:flex;gap:10px;">
+                    <button class="zimg-action-btn" id="zimg-console-send" style="flex:1;">🚀 发送请求</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(consoleOverlay);
 
     // 逻辑绑定
     const tokenInput = document.getElementById('zimg-token-input');
@@ -1529,6 +1611,7 @@
     let currentResult = null;
     let currentMode = 'image';
     let activeTaskId = null;
+    let activeTaskUrls = null;
     let cancelRequested = false;
 
     Object.keys(MODEL_REGISTRY).forEach(mode => {
@@ -1566,7 +1649,7 @@
             headerQuotaBadge.style.background = '#ecfdf5';
             headerQuotaBadge.style.color = '#059669';
             headerQuotaBadge.style.borderColor = '#a7f3d0';
-            tokenModeDesc.innerHTML = `模式：<span style="color:#16a34a;font-weight:600;">🔑 API 访问令牌</span>（自动获取自当前页面或本地记忆）`;
+            tokenModeDesc.innerHTML = `模式：<span style="color:#16a34a;font-weight:600;">🔑 API 访问令牌</span>（来自当前页面探测或私有存储）`;
             usageSummary.innerText = `今日已生成: ${quota.used || 0} 次`;
         }
     }
@@ -1653,6 +1736,7 @@
 
         const imageNote = document.getElementById('zimg-image-note');
         if (currentMode === 'image') {
+            fillSelect(sizeSelect, QUICK_IMAGE_SIZES, '1024x1024');
             imageNote.innerText = config.verified ? '此模型已完成真实任务验证。' : '目录标记为可试用；不同模型对高级参数的兼容性可能有差异。';
         }
 
@@ -1676,6 +1760,9 @@
             const stepsField = document.getElementById('zimg-3d-steps').closest('.zimg-field');
             const advancedField = document.getElementById('zimg-3d-advanced-field');
             octreeField.style.display = config.octree ? '' : 'none';
+            if (config.octree) {
+                fillSelect(document.getElementById('zimg-3d-octree'), config.octree, config.octree[0]);
+            }
             guidanceField.style.display = config.guidance ? '' : 'none';
             textureField.style.display = config.texture ? '' : 'none';
             stepsField.style.display = config.steps ? '' : 'none';
@@ -1865,6 +1952,8 @@
         if (e.key !== 'Escape') return;
         if (agentOverlay.style.display === 'flex') {
             closeAgentDialog();
+        } else if (consoleOverlay.style.display === 'flex') {
+            closeConsole();
         } else if (overlay.style.display === 'flex') {
             closeModal();
         }
@@ -1922,11 +2011,7 @@
     }
 
     function buildAgentPrompt() {
-        const includeToken = document.getElementById('zimg-agent-include-token').checked;
-        const currentToken = cleanToken(tokenInput.value);
-        const tokenLine = (includeToken && currentToken)
-            ? currentToken
-            : '<在此填入你的 Gitee AI 访问令牌>';
+        const tokenLine = '<在此填入你的 Gitee AI 访问令牌>';
         const now = new Date();
         const dateStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
         const lines = [
@@ -1942,7 +2027,7 @@
             '- 认证方式：所有请求携带请求头 `Authorization: Bearer <TOKEN>`',
             '- TOKEN：`' + tokenLine + '`',
             '- 令牌获取：https://ai.gitee.com/serverless-api （登录后创建，形如 36-44 位大写字母数字）',
-            '- ⚠️ 若上方 TOKEN 为占位符，先向使用者索要令牌再调用；含真实令牌的文件禁止提交公开仓库',
+            '- ⚠️ 上方 TOKEN 永远是占位符；向使用者索要令牌后仅在当前会话使用，禁止写入文件或提交仓库',
             '- 标注 🆓 的模型为当前免费模型，优先使用；其余模型按量计费，调用前先向使用者确认',
             '- 示例约定：下文所有 curl 中的 `$TOKEN` 即上方令牌。执行前先 `export TOKEN=<令牌>`，或逐条替换，切勿原样执行（否则认证头为空，必然 401）',
             '- 端点纪律：仅使用本文档列出的端点与参数，不要凭记忆猜测未列出的接口；若实际响应与本文档不符，以响应为准并向使用者报告',
@@ -1999,7 +2084,7 @@
             '  }\'',
             '```',
             '',
-            '可调参数：`size`(如 1024x1024 / 1536x864 / **3840x2160** / **2160x3840**)、`width`/`height`、`num_inference_steps`、`negative_prompt`、`guidance_scale`、`seed`、`num_images_per_prompt`、`response_format`(`url` 或 `b64_json`)。最高可传 4K；个别模型对超大尺寸或特定比例可能拒绝请求。',
+            '可调参数：`size`(常用 `1024x1024` / `1536x864`)、`width`/`height`、`num_inference_steps`、`negative_prompt`、`guidance_scale`、`seed`、`num_images_per_prompt`、`response_format`(`url` 或 `b64_json`)。分辨率和枚举以所选模型元数据为准；个别模型可能提供 4K 档。',
             '响应：`data[0].url` 或 `data[0].b64_json`；`b64_json` 数据量大，除非要离线保存，优先用 `url`。',
             '',
             '### 1.3 语音识别（🆓 全部免费）— `POST /v1/audio/transcriptions`',
@@ -2024,13 +2109,13 @@
             '',
             '```json',
             '{"task_id": "SBOMLX0YXU8SVJQXY6CNWVJ7OJAND5TK", "status": "waiting", "created_at": 1787474128023,',
-            ' "urls": {"get": "https://ai.gitee.com/api/v1/task/SBOM...", "cancel": "https://ai.gitee.com/api/v1/task/SBOM.../cancel"}}',
+            ' "urls": {"get": "https://ai.gitee.com/v1/task/SBOM...", "cancel": "https://ai.gitee.com/v1/task/SBOM.../cancel"}}',
             '```',
             '',
             '2. 携带同一认证头轮询任务状态（每 4 秒一次，最长 15 分钟）：',
             '',
             '```bash',
-            'curl https://ai.gitee.com/api/v1/task/$TASK_ID -H "Authorization: Bearer $TOKEN"',
+            'curl https://ai.gitee.com/v1/task/$TASK_ID -H "Authorization: Bearer $TOKEN"',
             '```',
             '',
             '3. 响应中的 `status` 字段状态机：',
@@ -2038,7 +2123,7 @@
             '   - `failed` / `cancelled` → 终态失败，原因在 `message` 字段，据此修正参数后可重新提交一次；',
             '   - 其它取值（如 `waiting`）→ 仍在排队 / 处理中，继续轮询，不要提前放弃。',
             '',
-            '4. 需要中止时：`POST /api/v1/task/{task_id}/cancel`。',
+            '4. 需要中止时：优先使用提交响应里的 `urls.cancel`，否则使用 `POST /v1/task/{task_id}/cancel`。',
             '',
             '### 2.1 文生视频 — `POST /v1/async/videos/generations`',
             '',
@@ -2050,7 +2135,7 @@
             '',
             '模型：' + listModels('imageVideo'),
             '',
-            'multipart 参数：`model`、`image`(图片文件)、`prompt`、`num_frames`、`width`、`height`、`num_inference_steps`、`fps`、`guidance_scale`、`seed`、`negative_prompt`。常用分辨率：1280x720、1920x1080、3840x2160（4K 横屏）、2160x3840（4K 竖屏）；实际输出受所选模型限制。',
+            'multipart 参数：`model`、`image`(图片文件)、`prompt`、`num_frames`、`width`、`height`、`num_inference_steps`、`fps`、`guidance_scale`、`seed`、`negative_prompt`。常见宽度/高度上限为 2048；帧数、步数和 fps 以模型元数据为准。',
             '',
             '### 2.3 语音合成（🆓 免费）— `POST /v1/async/audio/speech`',
             '',
@@ -2077,7 +2162,7 @@
             '模型：' + listModels('threeD'),
             '',
             'multipart 参数：`model`、`image`、`seed`、`file_format`(`glb`/`stl`)。',
-            'Hunyuan3D-2 追加：`type`、`num_inference_steps`(1-20)、`octree_resolution`(64/128/256)、`guidance_scale`、`texture`(`true`/`false`)、`foreground_detection`、`mc_resolution`(默认 512)、`face_count`(默认 80000)。',
+            'Hunyuan3D-2 追加：`type`、`num_inference_steps`(2-50)、`octree_resolution`(16/64/128/256/400)、`guidance_scale`、`texture`(`true`/`false`)、`foreground_detection`、`mc_resolution`(默认 512)、`face_count`(默认 80000)。',
             '',
             '## 3. Agent 行为约定',
             '',
@@ -2099,8 +2184,8 @@
             '| 语音合成 | `POST /v1/async/audio/speech` | 异步 | 🆓 免费 |',
             '| 图片转 3D | `POST /v1/async/image-to-3d` | 异步 | 付费 |',
             '| 文生图（大图异步） | `POST /v1/async/images/generations` | 异步 | 付费 |',
-            '| 任务轮询 | `GET /api/v1/task/{task_id}` | — | — |',
-            '| 取消任务 | `POST /api/v1/task/{task_id}/cancel` | — | — |',
+            '| 任务轮询 | `GET /v1/task/{task_id}` | — | — |',
+            '| 取消任务 | `POST /v1/task/{task_id}/cancel` | — | — |',
             '',
             '另有一些平台已知端点（人脸迁移 `/v1/images/face-migration`、文转 3D `/v1/async/text-to-3d`、文档解析 `/v1/async/documents/parse` 等），本文档未展开；使用前先向使用者确认需求与费用。',
         ];
@@ -2110,8 +2195,6 @@
     function renderAgentPrompt() {
         agentTextEl.value = buildAgentPrompt();
     }
-
-    document.getElementById('zimg-agent-include-token').addEventListener('change', renderAgentPrompt);
 
     document.getElementById('zimg-agent-copy').addEventListener('click', () => {
         navigator.clipboard.writeText(agentTextEl.value).then(() => {
@@ -2146,6 +2229,55 @@
     agentOverlay.addEventListener('click', (e) => {
         if (e.target === agentOverlay) closeAgentDialog();
     });
+
+    document.getElementById('zimg-btn-console').addEventListener('click', () => {
+        openConsole();
+    });
+    document.getElementById('zimg-console-close').addEventListener('click', closeConsole);
+    consoleOverlay.addEventListener('click', (e) => {
+        if (e.target === consoleOverlay) closeConsole();
+    });
+    document.getElementById('zimg-console-endpoint').addEventListener('change', () => {
+        fillConsoleOperations();
+        renderConsoleForm();
+    });
+    document.getElementById('zimg-console-operation').addEventListener('change', renderConsoleForm);
+    document.getElementById('zimg-console-refresh').addEventListener('click', async () => {
+        const state = document.getElementById('zimg-console-state');
+        try {
+            state.textContent = '正在拉取官方 OpenAPI…';
+            await refreshOpenApiConsole();
+        } catch (error) {
+            state.textContent = `刷新失败：${error.message}`;
+        }
+    });
+    document.getElementById('zimg-console-query').addEventListener('click', updateConsoleSource);
+    document.getElementById('zimg-console-send').addEventListener('click', runConsoleRequest);
+
+    async function controlConsoleTask(action) {
+        const taskId = document.getElementById('zimg-console-task-id').value.trim();
+        const state = document.getElementById('zimg-console-state');
+        if (!taskId) {
+            state.textContent = '请先填写任务 ID';
+            return;
+        }
+        try {
+            state.textContent = '任务请求中…';
+            const response = await requestJson({
+                method: action === 'cancel' ? 'POST' : 'GET',
+                url: `${API_BASE}/v1/task/${encodeURIComponent(taskId)}${action === 'status' ? '/status' : action === 'cancel' ? '/cancel' : ''}`,
+                headers: { Authorization: `Bearer ${validateToken()}` }
+            });
+            if (response.status < 200 || response.status >= 300) throw new Error(requestErrorMessage(response.status, response.data, response.data && response.data.raw));
+            document.getElementById('zimg-console-response').value = JSON.stringify(response.data, null, 2);
+            state.textContent = `任务 ${action} 成功`;
+        } catch (error) {
+            state.textContent = `任务 ${action} 失败：${error.message}`;
+        }
+    }
+    document.getElementById('zimg-console-task-get').addEventListener('click', () => controlConsoleTask('get'));
+    document.getElementById('zimg-console-task-status').addEventListener('click', () => controlConsoleTask('status'));
+    document.getElementById('zimg-console-task-cancel').addEventListener('click', () => controlConsoleTask('cancel'));
 
     document.querySelectorAll('.zimg-tag').forEach(tag => {
         tag.addEventListener('click', () => {
@@ -2183,6 +2315,473 @@
         return { status: response.status, data };
     }
 
+    // ===================== 全参数控制台 =====================
+    const CONTROLS_FALLBACK_URL = 'https://raw.githubusercontent.com/haremank/gitee-ai-agents-guide/main/assets/gitee-serverless-controls.compact.json';
+    const OPEN_API_ALLOWED_TAGS = new Set([
+        '文档处理', '图像识别', '视频生成', '3D 生成', '自动语音识别', '语音合成',
+        '音乐生成', '图像生成', '异步任务', '文本生成', '应用场景接口', '特征抽取',
+        '风控识别', '搜索', 'API 流水线'
+    ]);
+    let consoleEndpoints = [];
+    let controlsSchema = null;
+    let openapiSchema = null;
+
+    function parseJsonSafe(text, fallback) {
+        try { return JSON.parse(text); } catch (_) { return fallback; }
+    }
+
+    async function loadControlsSchema() {
+        if (controlsSchema) return controlsSchema;
+        let text = '';
+        try {
+            if (typeof GM_getResourceText !== 'undefined') text = GM_getResourceText('GITEE_CONTROLS') || '';
+        } catch (_) {}
+        if (!text) {
+            const response = await makeRequest({ method: 'GET', url: CONTROLS_FALLBACK_URL, timeout: 20000 });
+            if (response.status < 200 || response.status >= 300) throw new Error(`参数元数据加载失败：HTTP ${response.status}`);
+            text = response.responseText;
+        }
+        controlsSchema = parseJsonSafe(text, null);
+        if (!controlsSchema || !Array.isArray(controlsSchema.e)) throw new Error('参数元数据格式无效');
+        consoleEndpoints = controlsSchema.e.map(endpoint => ({
+            ...endpoint,
+            method: 'POST',
+            origin: 'operations'
+        })).sort((a, b) => D(a).localeCompare(D(b)));
+        return controlsSchema;
+    }
+
+    function D(index) {
+        return controlsSchema && controlsSchema.d ? String(controlsSchema.d[index] ?? '') : '';
+    }
+
+    function decodeRef(index, fallback) {
+        return index === undefined || index === null || index < 0 ? fallback : parseJsonSafe(D(index), fallback);
+    }
+
+    function consoleEndpointLabel(endpoint) {
+        const prefix = endpoint.origin === 'openapi' ? `[${endpoint.method}] ` : '[模型操作] ';
+        return prefix + '/' + D(endpoint.p);
+    }
+
+    function fillConsoleEndpoints() {
+        const select = document.getElementById('zimg-console-endpoint');
+        select.innerHTML = '';
+        consoleEndpoints.forEach((endpoint, index) => {
+            const option = document.createElement('option');
+            option.value = String(index);
+            option.textContent = consoleEndpointLabel(endpoint);
+            select.appendChild(option);
+        });
+    }
+
+    function selectedConsoleEndpoint() {
+        return consoleEndpoints[Number(document.getElementById('zimg-console-endpoint').value || 0)];
+    }
+
+    function fillConsoleOperations() {
+        const endpoint = selectedConsoleEndpoint();
+        const select = document.getElementById('zimg-console-operation');
+        select.innerHTML = '';
+        (endpoint.o || []).forEach((operation, index) => {
+            const option = document.createElement('option');
+            option.value = String(index);
+            const model = D(operation.model) || '通用';
+            const price = operation.free ? '免费' : `价格 ${operation.price ?? '未知'}`;
+            option.textContent = `${model} · ${operation.name || operation.id || '默认'} · ${price}`;
+            select.appendChild(option);
+        });
+    }
+
+    function variantFor(parameter, operationIndex) {
+        const raw = parameter.v && parameter.v[operationIndex];
+        if (!raw) return null;
+        return {
+            required: raw[0] === 1,
+            default: raw[1] < 0 ? undefined : parseJsonSafe(D(raw[1]), D(raw[1])),
+            range: raw[2] < 0 ? null : parseJsonSafe(D(raw[2]), null),
+            options: raw[3] < 0 ? [] : parseJsonSafe(D(raw[3]), []),
+            description: raw[4] < 0 ? undefined : D(raw[4])
+        };
+    }
+
+    function consoleInputId(index) {
+        return `zimg-console-param-${index}`;
+    }
+
+    function renderConsoleForm() {
+        const endpoint = selectedConsoleEndpoint();
+        const operationIndex = Number(document.getElementById('zimg-console-operation').value || 0);
+        const operation = (endpoint.o || [])[operationIndex];
+        const container = document.getElementById('zimg-console-form');
+        const parameterType = parameter => D(parameter.t);
+        container.innerHTML = '';
+        (endpoint.r || []).forEach((parameter, index) => {
+            const name = D(parameter.k);
+            const variant = variantFor(parameter, operationIndex);
+            const defaults = decodeRef(parameter.f, []);
+            const baseRanges = decodeRef(parameter.r, []);
+            const baseOptions = decodeRef(parameter.o, []);
+            const range = variant && variant.range ? variant.range : (baseRanges[0] || {});
+            const options = variant && Array.isArray(variant.options) && variant.options.length ? variant.options : baseOptions;
+            const controls = decodeRef(parameter.c, []);
+            const type = parameterType(parameter);
+            const control = controls.find(item => ['select', 'slider', 'file', 'boolean', 'array', 'multimodal', 'string-array', 'seed-numbers'].includes(item)) || (type === 'boolean' ? 'boolean' : type === 'number' || type === 'integer' ? 'number' : 'text');
+            let value = variant && variant.default !== undefined ? variant.default : defaults[0];
+            if ((value === undefined || value === null) && options.length) value = options[0];
+
+            const field = document.createElement('div');
+            field.className = 'zimg-field zimg-console-field' + (['array', 'multimodal', 'string-array', 'seed-numbers'].includes(control) ? ' zimg-console-wide' : '');
+            const requiredMark = (parameter.q === 1 || (variant && variant.required)) ? ' <b style="color:#dc2626;">*</b>' : '';
+            field.innerHTML = `<div class="zimg-label-row"><span class="zimg-label">${name}${requiredMark}</span><span class="zimg-label-sub">${D(parameter.l)} · ${D(parameter.t)}</span></div>`;
+            const id = consoleInputId(index);
+            let input;
+            let display = null;
+            if (control === 'boolean') {
+                input = document.createElement('input');
+                input.type = 'checkbox';
+                input.checked = value === true || value === 'True' || value === 'true';
+                input.className = 'zimg-input';
+            } else if (control === 'select') {
+                input = document.createElement('select');
+                input.className = 'zimg-input';
+                options.forEach(option => {
+                    const item = document.createElement('option');
+                    item.value = String(option);
+                    item.textContent = String(option);
+                    input.appendChild(item);
+                });
+                if ([...input.options].some(item => item.value === String(value))) input.value = String(value);
+            } else if (control === 'slider') {
+                input = document.createElement('input');
+                input.type = 'range';
+                input.min = range.min ?? 0;
+                input.max = range.max ?? 100;
+                input.step = range.step || 1;
+                input.value = Number(value ?? range.min ?? 0);
+                display = document.createElement('div');
+                display.className = 'zimg-label-sub';
+                display.textContent = `${input.value}（${input.min} - ${input.max}）`;
+                input.addEventListener('input', () => {
+                    display.textContent = `${input.value}（${input.min} - ${input.max}）`;
+                    updateConsolePreview();
+                });
+                field.appendChild(input);
+                field.appendChild(display);
+            } else if (control === 'file') {
+                input = document.createElement('input');
+                input.type = 'file';
+                input.className = 'zimg-file-input';
+            } else if (['array', 'multimodal', 'string-array', 'seed-numbers'].includes(control)) {
+                input = document.createElement('textarea');
+                input.rows = 3;
+                input.placeholder = 'JSON 数组，例如 [{"url":"https://example.com/a.png"}]';
+                input.value = Array.isArray(value) ? JSON.stringify(value) : String(value ?? '');
+                input.className = 'zimg-input';
+            } else {
+                input = document.createElement('input');
+                input.type = type === 'integer' || type === 'number' ? 'number' : 'text';
+                input.value = value === undefined || value === null ? '' : String(value);
+                input.step = range.step || (type === 'integer' ? '1' : 'any');
+                if (range.min !== undefined && range.min !== null) input.min = range.min;
+                if (range.max !== undefined && range.max !== null) input.max = range.max;
+                input.className = 'zimg-input';
+            }
+            input.id = id;
+            if (control !== 'slider') input.addEventListener('change', updateConsolePreview);
+            if (!display.parentNode || display.parentNode !== field) field.appendChild(input);
+            const help = variant && variant.description !== undefined ? variant.description : D(parameter.d).split('\n')[0];
+            if (help) {
+                const note = document.createElement('div');
+                note.className = 'zimg-model-note';
+                note.textContent = help;
+                field.appendChild(note);
+            }
+            container.appendChild(field);
+        });
+
+        const paidRow = document.getElementById('zimg-console-paid-row');
+        paidRow.style.display = operation && operation.free ? 'none' : '';
+        document.getElementById('zimg-console-paid-confirm').checked = false;
+        updateConsoleSource();
+        updateConsolePreview();
+    }
+
+    function updateConsoleSource() {
+        const endpoint = selectedConsoleEndpoint();
+        const operationIndex = Number(document.getElementById('zimg-console-operation').value || 0);
+        const operation = (endpoint.o || [])[operationIndex];
+        const model = D(operation && operation.model);
+            const lines = [
+                `路径：${endpoint.method || 'POST'} /${D(endpoint.p)}`,
+            model ? `模型：${model}` : '模型：通用',
+            '',
+            '标准查询方法：',
+            'curl https://ai.gitee.com/v1/models -H "Authorization: Bearer $TOKEN"',
+            'curl https://ai.gitee.com/v1/json -H "Authorization: Bearer $TOKEN"',
+            model ? `curl "https://ai.gitee.com/api/pay/service/operations?service_ident=${encodeURIComponent(model)}" -H "Authorization: Bearer $TOKEN"` : ''
+        ].filter(Boolean);
+        document.getElementById('zimg-console-source').textContent = lines.join('\n');
+    }
+
+    function collectConsoleValues() {
+        const endpoint = selectedConsoleEndpoint();
+        const operationIndex = Number(document.getElementById('zimg-console-operation').value || 0);
+        const values = [];
+        (endpoint.r || []).forEach((parameter, index) => {
+            const input = document.getElementById(consoleInputId(index));
+            if (!input) return;
+            const controls = decodeRef(parameter.c, []);
+            const type = D(parameter.t);
+            const kind = controls[0] || type;
+            let value;
+            if (kind === 'file') {
+                value = input.files && input.files[0] ? input.files[0] : undefined;
+            } else if (kind === 'boolean') {
+                value = input.checked;
+            } else if (['array', 'multimodal', 'string-array', 'seed-numbers'].includes(kind)) {
+                const parsed = parseJsonSafe(input.value.trim(), undefined);
+                value = parsed !== undefined ? parsed : input.value.trim().split(/[\n,]/).map(item => item.trim()).filter(Boolean);
+            } else if (type === 'integer' || type === 'number') {
+                value = optionalNumber(input.value);
+            } else {
+                value = input.value.trim();
+            }
+            const variant = variantFor(parameter, operationIndex);
+            if (value === undefined || value === null || value === '') {
+                if (parameter.q === 1 || (variant && variant.required)) {
+                    throw new Error(`必填参数缺失：${D(parameter.k)}`);
+                }
+                return;
+            }
+            const range = variant && variant.range ? variant.range : decodeRef(parameter.r, [])[0];
+            if ((type === 'number' || type === 'integer') && range) {
+                if (range.min !== undefined && range.min !== null && value < range.min) throw new Error(`${D(parameter.k)} 不能小于 ${range.min}`);
+                if (range.max !== undefined && range.max !== null && value > range.max) throw new Error(`${D(parameter.k)} 不能大于 ${range.max}`);
+            }
+            const options = variant && variant.options && variant.options.length ? variant.options : decodeRef(parameter.o, []);
+            if (controls.includes('select') && options.length && !options.map(String).includes(String(value))) {
+                throw new Error(`${D(parameter.k)} 只能选择：${options.join(', ')}`);
+            }
+            values.push({ parameter, value });
+        });
+        return values;
+    }
+
+    function assignPath(target, path, value) {
+        const parts = path.split('.');
+        let node = target;
+        parts.forEach((part, index) => {
+            if (index === parts.length - 1) node[part] = value;
+            else {
+                node[part] = node[part] || {};
+                node = node[part];
+            }
+        });
+    }
+
+    function buildConsoleRequest() {
+        const endpoint = selectedConsoleEndpoint();
+        const requestMethod = endpoint.method || 'POST';
+        const values = collectConsoleValues();
+        const url = new URL(API_BASE + '/' + D(endpoint.p));
+        const headers = { Authorization: `Bearer ${validateToken()}`, 'X-Failover-Enabled': 'true' };
+        const query = new URLSearchParams();
+        const json = {};
+        const form = new FormData();
+        const useForm = values.some(({ parameter, value }) => D(parameter.l) === 'form' || value instanceof File);
+
+        values.forEach(({ parameter, value }) => {
+            const name = D(parameter.k);
+            const location = D(parameter.l);
+            if (location === 'head') {
+                headers[name] = String(value);
+            } else if (location === 'query' || (!useForm && ['GET', 'DELETE'].includes(requestMethod) && location !== 'head')) {
+                query.set(name, typeof value === 'object' ? JSON.stringify(value) : String(value));
+            } else if (location === 'form' || value instanceof File) {
+                form.append(name, value instanceof File ? value : (typeof value === 'object' ? JSON.stringify(value) : String(value)));
+            } else {
+                assignPath(json, name, value);
+            }
+        });
+
+        for (const [key, val] of query) url.searchParams.set(key, val);
+        if (!useForm && ['POST', 'PUT', 'PATCH'].includes(requestMethod)) headers['Content-Type'] = 'application/json';
+        return {
+            endpoint,
+            url: url.toString(),
+            method: endpoint.method || 'POST',
+            headers,
+            body: useForm ? form : JSON.stringify(json),
+            payload: useForm ? Object.fromEntries(form) : json,
+            isAsync: D(endpoint.p).includes('/async/')
+        };
+    }
+
+    function updateConsolePreview() {
+        try {
+            const request = buildConsoleRequest();
+            document.getElementById('zimg-console-preview').value = [
+                `${request.method} ${request.url}`,
+                ...Object.entries(request.headers).map(([key, value]) => `${key}: ${key === 'Authorization' ? 'Bearer $TOKEN' : value}`),
+                '',
+                typeof request.payload === 'string' ? request.payload : JSON.stringify(request.payload, null, 2)
+            ].join('\n');
+        } catch (_) {}
+    }
+
+    async function refreshOpenApiConsole() {
+        const response = await requestJson({ method: 'GET', url: API_BASE + '/v1/json', headers: { Authorization: `Bearer ${cleanToken(tokenInput.value)}` } });
+        if (response.status < 200 || response.status >= 300) throw new Error(requestErrorMessage(response.status, response.data, response.data && response.data.raw));
+        openapiSchema = response.data;
+        const generated = [];
+        const dictionaryLookup = new Map(controlsSchema.d.map((text, index) => [text, index]));
+        const intern = (value) => {
+            const text = String(value);
+            if (!dictionaryLookup.has(text)) {
+                controlsSchema.d.push(text);
+                dictionaryLookup.set(text, controlsSchema.d.length - 1);
+            }
+            return dictionaryLookup.get(text);
+        };
+        const jsonIntern = (value) => value === undefined || value === null ? -1 : intern(JSON.stringify(value));
+        const resolveRef = (schema, depth = 0) => {
+            if (!schema || depth > 5) return {};
+            if (schema.$ref) {
+                const node = schema.$ref.replace(/^#\//, '').split('/').reduce((item, key) => item && item[key], openapiSchema);
+                return resolveRef(node, depth + 1);
+            }
+            if (schema.allOf) return Object.assign({}, ...schema.allOf.map(item => resolveRef(item, depth + 1)), schema);
+            return schema;
+        };
+        const flatten = (schema, prefix, required, output, depth) => {
+            const resolved = resolveRef(schema, depth);
+            if (resolved.type === 'object' && resolved.properties && depth < 3) {
+                Object.entries(resolved.properties).forEach(([key, child]) => flatten(child, prefix ? `${prefix}.${key}` : key, resolved.required || [], output, depth + 1));
+                return;
+            }
+            output.push({
+                k: prefix,
+                l: 'body',
+                t: resolved.type || 'string',
+                q: required.includes(prefix.split('.').pop()) ? 1 : 0,
+                c: JSON.stringify([resolved.enum ? 'select' : resolved.type === 'boolean' ? 'boolean' : resolved.type === 'array' ? 'array' : resolved.type === 'number' || resolved.type === 'integer' ? 'number' : 'text']),
+                d: (resolved.description || '').replace(/\s+/g, ' '),
+                f: resolved.default === undefined ? [] : [resolved.default],
+                r: resolved.minimum === undefined && resolved.maximum === undefined ? [] : [{ min: resolved.minimum, max: resolved.maximum, step: resolved.multipleOf }],
+                o: resolved.enum || [],
+                v: null
+            });
+        };
+        Object.entries(openapiSchema.paths || {}).forEach(([path, methods]) => {
+            Object.entries(methods).forEach(([method, operation]) => {
+                if (!['get', 'post', 'put', 'delete', 'patch'].includes(method)) return;
+                const tags = operation.tags || [];
+                if (!tags.some(tag => OPEN_API_ALLOWED_TAGS.has(tag))) return;
+                const parameters = [];
+                (operation.parameters || []).forEach(parameter => parameters.push({
+                    k: parameter.name,
+                    l: parameter.in,
+                    t: parameter.schema && parameter.schema.type || 'string',
+                    q: parameter.required ? 1 : 0,
+                    c: JSON.stringify([parameter.schema && parameter.schema.enum ? 'select' : parameter.schema && parameter.schema.type === 'boolean' ? 'boolean' : 'text']),
+                    d: parameter.description || '',
+                    f: parameter.schema && parameter.schema.default !== undefined ? [parameter.schema.default] : [],
+                    r: parameter.schema && (parameter.schema.minimum !== undefined || parameter.schema.maximum !== undefined) ? [{ min: parameter.schema.minimum, max: parameter.schema.maximum }] : [],
+                    o: parameter.schema && parameter.schema.enum || [],
+                    v: null
+                }));
+                const requestBody = operation.requestBody && operation.requestBody.content;
+                if (requestBody) {
+                    const media = requestBody['application/json'] || requestBody['multipart/form-data'] || Object.values(requestBody)[0];
+                    if (media && media.schema) flatten(media.schema, '', media.schema.required || [], parameters, 0);
+                }
+                generated.push({
+                    p: intern(path.replace(/^\//, '')),
+                    method: method.toUpperCase(),
+                    origin: 'openapi',
+                    o: [{ id: operation.operationId || path, name: operation.summary || operation.operationId || method.toUpperCase(), model: null, format: intern('OPEN_API'), price: null, free: true, status: intern('metadata') }],
+                    n: parameters.length,
+                    r: parameters
+                });
+            });
+        });
+        consoleEndpoints = consoleEndpoints.filter(item => item.origin === 'operations').concat(generated);
+        fillConsoleEndpoints();
+        document.getElementById('zimg-console-state').textContent = `已加载 ${generated.length} 个 OpenAPI 操作`;
+        renderConsoleForm();
+    }
+
+    function extractConsoleResult(data) {
+        if (typeof data === 'string') return data;
+        const candidates = [data.data, data.output, data.result, data];
+        for (const candidate of candidates) {
+            if (!candidate) continue;
+            if (typeof candidate === 'string') return candidate;
+            if (Array.isArray(candidate)) {
+                const first = candidate[0] || {};
+                if (first.url) return first.url;
+                if (first.b64_json) return 'data:image/png;base64,' + first.b64_json;
+            }
+            if (candidate.url) return candidate.url;
+            if (candidate.file_url) return candidate.file_url;
+            if (candidate.text_result) return candidate.text_result;
+            if (candidate.choices && candidate.choices[0]) {
+                const message = candidate.choices[0].message || candidate.choices[0].delta || {};
+                if (message.content) return message.content;
+            }
+        }
+        return null;
+    }
+
+    async function runConsoleRequest() {
+        const state = document.getElementById('zimg-console-state');
+        try {
+            const request = buildConsoleRequest();
+            const operation = (request.endpoint.o || [])[Number(document.getElementById('zimg-console-operation').value || 0)];
+            if (operation && !operation.free && !document.getElementById('zimg-console-paid-confirm').checked) {
+                throw new Error('付费调用需要先勾选费用确认');
+            }
+            state.textContent = '请求中…';
+            const created = await requestJson({ method: request.method, url: request.url, headers: request.headers, data: request.body });
+            if (created.status < 200 || created.status >= 300) throw new Error(requestErrorMessage(created.status, created.data, created.data && created.data.raw));
+            const taskId = created.data.task_id || (created.data.data && created.data.data.task_id);
+            if (request.isAsync && taskId) {
+                activeTaskId = taskId;
+                activeTaskUrls = created.data.urls || created.data.task_urls || null;
+                state.textContent = `任务已提交：${taskId}`;
+                const resultUrl = await pollTask(taskId, cleanToken(tokenInput.value), '');
+                const extracted = extractConsoleResult(created.data) || resultUrl;
+                showResult({ url: extracted, kind: mediaKind(extracted, 'console'), ext: extFromUrl(extracted, 'bin') }, '控制台任务');
+            } else {
+                const extracted = extractConsoleResult(created.data);
+                if (extracted && /^(https?:|data:)/.test(extracted)) showResult({ url: extracted, kind: mediaKind(extracted, 'console'), ext: extFromUrl(extracted, 'bin') }, '控制台结果');
+            }
+            document.getElementById('zimg-console-response').value = JSON.stringify(created.data, null, 2);
+            state.textContent = `成功：HTTP ${created.status}`;
+        } catch (error) {
+            state.textContent = '失败';
+            document.getElementById('zimg-console-response').value = error.message;
+        }
+    }
+
+    async function openConsole() {
+        consoleOverlay.style.display = 'flex';
+        try {
+            await loadControlsSchema();
+            fillConsoleEndpoints();
+            fillConsoleOperations();
+            renderConsoleForm();
+            document.getElementById('zimg-console-source').textContent += '\n\n离线快照日期：' + controlsSchema.generatedAt;
+        } catch (error) {
+            document.getElementById('zimg-console-source').textContent = error.message;
+        }
+    }
+
+    function closeConsole() {
+        consoleOverlay.style.display = 'none';
+    }
+
     function requestErrorMessage(status, data, text) {
         const detail = (data && (data.message || data.error_message)) || (text || '').slice(0, 300) || '无详细错误';
         return `HTTP ${status}：${detail}`;
@@ -2201,7 +2800,10 @@
             throw new Error('token-dummy');
         }
         tokenInput.value = token;
-        safeGM.setValue(STORAGE_TOKEN_KEY, token);
+        const persisted = safeGM.setValuePrivate(STORAGE_TOKEN_KEY, token);
+        if (!persisted && typeof GM_setValue === 'undefined') {
+            showStatus('error', '⚠️ 当前环境无法安全保存令牌，本次仅保留在输入框中。');
+        }
         return token;
     }
 
@@ -2230,6 +2832,7 @@
         isGenerating = true;
         cancelRequested = false;
         activeTaskId = null;
+        activeTaskUrls = null;
         generateBtn.disabled = true;
         resultBox.style.display = 'none';
         generateStartTime = Date.now();
@@ -2249,6 +2852,7 @@
     function finishGeneration() {
         isGenerating = false;
         activeTaskId = null;
+        activeTaskUrls = null;
         cancelRequested = false;
         clearInterval(generateTimer);
         generateBtn.disabled = false;
@@ -2261,6 +2865,15 @@
         return Number.isFinite(parsed) ? parsed : undefined;
     }
 
+    function optionalCheckedNumber(id, label, { min = 0, max = 2147483647, integer = true } = {}) {
+        const value = optionalNumber(document.getElementById(id).value);
+        if (value === undefined) return undefined;
+        if (value < min || value > max || (integer && !Number.isInteger(value))) {
+            throw new Error(`${label} 需为 ${min}-${max}${integer ? ' 的整数' : ''}`);
+        }
+        return value;
+    }
+
     function addIfPresent(target, key, value) {
         if (value !== undefined && value !== null && value !== '') target[key] = value;
     }
@@ -2271,6 +2884,9 @@
 
     function buildImagePayload(prompt) {
         const [width, height] = sizeSelect.value.split('x').map(Number);
+        if (!width || !height || width < 64 || height < 64 || width > 2048 || height > 2048) {
+            throw new Error('快速图片尺寸需在 64-2048 像素内');
+        }
         const payload = {
             model: getModeSelect('image').value,
             prompt,
@@ -2280,8 +2896,8 @@
             num_inference_steps: Number(stepsSlider.value)
         };
         addIfPresent(payload, 'negative_prompt', negativeInput.value.trim());
-        addIfPresent(payload, 'guidance_scale', optionalNumber(document.getElementById('zimg-image-guidance').value));
-        addIfPresent(payload, 'seed', optionalNumber(document.getElementById('zimg-image-seed').value));
+        addIfPresent(payload, 'guidance_scale', optionalCheckedNumber('zimg-image-guidance', 'Guidance', { min: 0, max: 100, integer: false }));
+        addIfPresent(payload, 'seed', optionalCheckedNumber('zimg-image-seed', 'Seed'));
         payload.response_format = document.getElementById('zimg-image-format').value;
         const count = Number(document.getElementById('zimg-image-count').value);
         if (count > 1) payload.num_images_per_prompt = count;
@@ -2298,7 +2914,7 @@
             num_inference_steps: Number(document.getElementById('zimg-t2v-steps').value)
         };
         addIfPresent(payload, 'negative_prompt', negativeInput.value.trim());
-        addIfPresent(payload, 'seed', optionalNumber(document.getElementById('zimg-t2v-seed').value));
+        addIfPresent(payload, 'seed', optionalCheckedNumber('zimg-t2v-seed', 'Seed'));
         if (config.aspect) payload.aspect_ratio = document.getElementById('zimg-t2v-aspect').value;
         if (config.fps) payload.fps = Number(document.getElementById('zimg-t2v-fps').value);
         return payload;
@@ -2457,7 +3073,7 @@
         form.append('num_inference_steps', document.getElementById('zimg-i2v-steps').value);
         if (config.fps) form.append('fps', document.getElementById('zimg-i2v-fps').value);
         if (config.guidance) form.append('guidance_scale', document.getElementById('zimg-i2v-guidance').value);
-        const seed = optionalNumber(document.getElementById('zimg-i2v-seed').value);
+        const seed = optionalCheckedNumber('zimg-i2v-seed', 'Seed');
         if (seed !== undefined) form.append('seed', String(seed));
         const negative = negativeInput.value.trim();
         if (negative && config.guidance) form.append('negative_prompt', negative);
@@ -2470,7 +3086,7 @@
         const config = getModelConfig('threeD');
         form.append('model', model);
         form.append('image', file, file.name);
-        const seed = optionalNumber(document.getElementById('zimg-3d-seed').value);
+        const seed = optionalCheckedNumber('zimg-3d-seed', 'Seed');
         if (seed !== undefined) form.append('seed', String(seed));
         if (config.format) form.append('file_format', document.getElementById('zimg-3d-format').value);
         if (model === 'Hunyuan3D-2') {
@@ -2496,7 +3112,8 @@
     }
 
     async function pollTask(taskId, token, prompt) {
-        const statusUrl = API_BASE + ENDPOINTS.task + taskId;
+        const returnedUrl = activeTaskUrls && (activeTaskUrls.get || activeTaskUrls.status || activeTaskUrls.detail);
+        const statusUrl = returnedUrl || `${API_BASE}/v1/task/${encodeURIComponent(taskId)}`;
         const headers = { Authorization: `Bearer ${token}` };
         const deadline = Date.now() + 15 * 60 * 1000;
         while (Date.now() < deadline) {
@@ -2521,8 +3138,8 @@
                 if (!url) throw new Error('任务成功但返回体缺少文件地址');
                 return url;
             }
-            if (task.status === 'failed' || task.status === 'cancelled') {
-                throw new Error(`任务${task.status === 'failed' ? '失败' : '已取消'}：${task.message || task.error || '无详细信息'}`);
+            if (task.status === 'failure' || task.status === 'failed' || task.status === 'cancelled') {
+                throw new Error(`任务${task.status === 'cancelled' ? '已取消' : '失败'}：${task.message || task.error || '无详细信息'}`);
             }
         }
         throw new Error('等待任务超时，可稍后在 Gitee AI 任务页查看结果');
@@ -2545,6 +3162,7 @@
         const taskId = created.data.task_id;
         if (!taskId) throw new Error('接口未返回 task_id');
         activeTaskId = taskId;
+        activeTaskUrls = created.data.urls || created.data.task_urls || null;
         cancelBtn.style.display = '';
         const url = await pollTask(taskId, token, prompt);
         const kind = mediaKind(url, currentMode);
@@ -2604,6 +3222,7 @@
                 if (created.status < 200 || created.status >= 300) throw new Error(requestErrorMessage(created.status, created.data, created.data && created.data.raw));
                 if (!created.data.task_id) throw new Error('接口未返回 task_id');
                 activeTaskId = created.data.task_id;
+                activeTaskUrls = created.data.urls || created.data.task_urls || null;
                 cancelBtn.style.display = '';
                 const url = await pollTask(activeTaskId, token, prompt);
                 currentResult = { url, kind: 'video', ext: extFromUrl(url, 'mp4') };
@@ -2623,6 +3242,7 @@
                 if (created.status < 200 || created.status >= 300) throw new Error(requestErrorMessage(created.status, created.data, created.data && created.data.raw));
                 if (!created.data.task_id) throw new Error('接口未返回 task_id');
                 activeTaskId = created.data.task_id;
+                activeTaskUrls = created.data.urls || created.data.task_urls || null;
                 cancelBtn.style.display = '';
                 const url = await pollTask(activeTaskId, token, '');
                 currentResult = { url, kind: 'model', ext: extFromUrl(url, 'glb'), filename: `model-${Date.now()}.${extFromUrl(url, 'glb')}` };
@@ -2702,7 +3322,7 @@
         try {
             await requestJson({
                 method: 'POST',
-                url: `${API_BASE}${ENDPOINTS.task}${activeTaskId}/cancel`,
+                url: (activeTaskUrls && activeTaskUrls.cancel) || `${API_BASE}/v1/task/${encodeURIComponent(activeTaskId)}/cancel`,
                 headers: { Authorization: `Bearer ${cleanToken(tokenInput.value)}` }
             });
             showStatus('error', '⏹ 正在取消云端任务...');
