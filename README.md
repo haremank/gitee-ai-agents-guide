@@ -1,7 +1,7 @@
 # Gitee AI 多模型生成工作台
 
 [![GitHub](https://img.shields.io/badge/GitHub-haremank%2Fgitee--ai--agents--guide-blue?style=flat&logo=github)](https://github.com/haremank/gitee-ai-agents-guide)
-[![Version](https://img.shields.io/badge/版本-v2.7.0-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
+[![Version](https://img.shields.io/badge/版本-v2.9.0-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
 [![Usage](https://img.shields.io/badge/用途-仅限个人学习-red)](https://github.com/haremank/gitee-ai-agents-guide#readme)
 
 基于 Tampermonkey 的油猴脚本：在任意网页提供可拖拽的多模型生成面板，自动获取令牌与额度，支持异步任务轮询、结果预览下载与 Agent 提示词一键导出。
@@ -22,7 +22,15 @@
 - **令牌自动管理**：自动提取体验令牌与剩余额度，也可手动填入个人 Key，仅存浏览器本地
 - **全参数控制台**：按端点与操作展开 OpenAPI 参数表单，同步接口可直接调用，异步任务可查询 / 取消；付费调用前需二次确认
 - **Agent 提示词导出**：一键导出接口指南（即 [`docs/gitee-ai-agents.md`](docs/gitee-ai-agents.md)），供 Codex / Claude Code 直接调用
-- **异步全流程**：提交任务 → 自动轮询 → 结果预览 / 下载 / 历史记录
+- **异步全流程**：提交任务 → 自动轮询 → 结果预览 / 下载 / 本地生成库
+
+### 本地生成库
+
+生成结果会自动保存到当前浏览器的 IndexedDB，图片、视频、音频、文本和 3D 文件可在面板内预览、搜索、按类型筛选、单独删除或一键清空。已下载到本地的副本不依赖 Gitee/BOS 签名 URL，因此远程链接过期后仍能打开；旧版 12 条 URL 历史会在首次打开面板时自动迁移。
+
+面板还会读取 Gitee 官方异步任务列表（近 7 天）和并发配额，展示等待、进行中、成功、失败、取消数量。成功任务可单条或批量下载并导入本地库；导入按 `task_id` 去重，不会重新提交付费任务。失败和取消项只显示原因。
+
+IndexedDB 按浏览器 Profile、站点源点和隐私模式隔离，不会跨浏览器或跨设备同步，也不是备份存储。清理浏览器站点数据会删除本地库；重要产物仍建议另存到项目目录。
 
 ### 标准参数查询
 
