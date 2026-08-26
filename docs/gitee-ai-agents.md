@@ -103,10 +103,24 @@ curl https://ai.gitee.com/v1/task/$TASK_ID -H "Authorization: Bearer $TOKEN"
 
 3. 响应中的 `status` 字段状态机：
    - `success` → 终态成功。完整响应示例：`{"task_id":"...","status":"success","output":{"file_url":"https://gitee-ai.su.bcebos.com/..."},"price":0.0,"currency":"CNY","urls":{...}}`，结果取 `output.file_url`（或 `output.url`）；
-   - `failed` / `cancelled` → 终态失败，原因在 `message` 字段，据此修正参数后可重新提交一次；
+   - `failure` / `cancelled` → 终态失败或已取消，原因在 `message` 字段，据此修正参数后可重新提交一次；
    - 其它取值（如 `waiting`）→ 仍在排队 / 处理中，继续轮询，不要提前放弃。
 
 4. 需要中止时：优先使用提交响应里的 `urls.cancel`，否则使用 `POST /v1/task/{task_id}/cancel`。
+
+### 2.0 云端任务列表与并发配额
+
+任务列表只保留近 7 天记录，按创建时间倒序；成功产物签名链接有效期约 1 天。需要长期保留时立即下载：
+
+```bash
+# 分页读取官方异步任务；返回 {"total":25,"items":[...]}
+curl "https://ai.gitee.com/v1/tasks?page=1&size=100" -H "Authorization: Bearer $TOKEN"
+
+# 当前可用的异步并发槽位
+curl https://ai.gitee.com/v1/tasks/available-quota -H "Authorization: Bearer $TOKEN"
+```
+
+`InferenceTask.items[*]` 常用字段：`task_id`、`status`(`waiting`/`in_progress`/`success`/`failure`/`cancelled`)、`created_at`、`started_at`、`completed_at`、`output`、`price`、`currency`、`urls.get`、`urls.cancel`。列表响应不含提交时的提示词和模型名；导入本地库时应按 `task_id` 去重，并优先保存文件内容而不是仅保存签名 URL。
 
 ### 2.1 文生视频 — `POST /v1/async/videos/generations`
 
@@ -152,7 +166,7 @@ Hunyuan3D-2 追加：`type`、`num_inference_steps`(2-50)、`octree_resolution`(
 1. **免费优先**：文本、语音识别、语音合成优先选 🆓 模型；图像 / 视频 / 3D 为付费模型，调用前先向使用者确认。
 2. **轮询纪律**：异步任务每 4 秒 GET 一次任务状态，最多 15 分钟；不要小于 1 秒的频率轰炸接口。
 3. **错误处理**：HTTP 401 → 令牌无效，停止重试并提示使用者；429 / 5xx → 指数退避重试（最多 3 次）；其余 4xx 按 message 修正参数。
-4. **产物落地**：结果 URL 直接交给使用者，或下载保存到项目 `output/` 目录；`file_url` 为百度云 BOS 签名链接，有效期约 7 天，需长期保留请及时下载。配套油猴脚本 v2.8.0 会把面板生成结果额外保留在浏览器 IndexedDB 本地库中，但这不是跨设备备份，Agent 工作流仍应按本条下载重要产物。
+4. **产物落地**：结果 URL 直接交给使用者，或下载保存到项目 `output/` 目录；`file_url` 为百度云 BOS 签名链接，有效期约 1 天，需长期保留请及时下载。配套油猴脚本 v2.9.0 会把面板生成结果和云端成功任务额外保留在浏览器 IndexedDB 本地库中，但这不是跨设备备份，Agent 工作流仍应按本条下载重要产物。
 5. **勿泄露令牌**：不要把 TOKEN 打印到日志、注释或对外输出中。
 
 ## 4. 端点速查表
@@ -167,6 +181,8 @@ Hunyuan3D-2 追加：`type`、`num_inference_steps`(2-50)、`octree_resolution`(
 | 语音合成 | `POST /v1/async/audio/speech` | 异步 | 🆓 免费 |
 | 图片转 3D | `POST /v1/async/image-to-3d` | 异步 | 付费 |
 | 文生图（大图异步） | `POST /v1/async/images/generations` | 异步 | 付费 |
+| 任务列表 | `GET /v1/tasks?page=1&size=100` | — | — |
+| 并发配额 | `GET /v1/tasks/available-quota` | — | — |
 | 任务轮询 | `GET /v1/task/{task_id}` | — | — |
 | 取消任务 | `POST /v1/task/{task_id}/cancel` | — | — |
 
