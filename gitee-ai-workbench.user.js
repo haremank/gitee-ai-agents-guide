@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.0
+// @version      2.9.1
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -250,6 +250,8 @@
     let cloudTaskTotal = 0;
     let cloudTaskQuota = null;
     let importingCloudTasks = false;
+    let cloudTaskExpired = new Set();
+    const CLOUD_TASK_LINK_TTL = 24 * 60 * 60 * 1000;
     try {
         const savedHist = safeGM.getValue(STORAGE_HISTORY_KEY, '') || localStorage.getItem(STORAGE_HISTORY_KEY);
         if (savedHist) historyList = JSON.parse(savedHist);
@@ -2544,7 +2546,10 @@
             cloudTaskSummary.appendChild(pill);
         });
         cloudTaskStrip.innerHTML = '';
-        importSuccessBtn.disabled = importingCloudTasks || !(counts.success > 0);
+        const importable = cloudTasks.filter(task => task.status === 'success' &&
+            cloudTaskOutputUrl(task) && !libraryList.some(item => item.taskId === task.task_id) &&
+            !cloudTaskLinkExpired(task)).length;
+        importSuccessBtn.disabled = importingCloudTasks || importable === 0;
         if (error) {
             const empty = document.createElement('div');
             empty.className = 'zimg-library-empty';
@@ -2576,26 +2581,41 @@
             card.append(id, status, time);
             if (task.status === 'success' && cloudTaskOutputUrl(task)) {
                 const imported = libraryList.some(item => item.taskId === task.task_id);
+                const expired = imported ? false : cloudTaskLinkExpired(task);
                 const button = document.createElement('button');
                 button.type = 'button';
                 button.className = 'zimg-cloud-import';
-                button.textContent = imported ? '✅ 已在本地库' : '📥 导入本地库';
-                button.disabled = imported || importingCloudTasks;
-                button.addEventListener('click', async event => {
-                    event.stopPropagation();
+                if (imported) {
+                    button.textContent = '✅ 已在本地库';
                     button.disabled = true;
-                    button.textContent = '⏳ 导入中';
-                    try {
-                        await importCloudTask(task);
-                        button.textContent = libraryList.some(item => item.taskId === task.task_id) ? '✅ 已导入' : '⚠️ 远程保留';
-                    } catch (err) {
-                        console.warn('[Gitee AI Generator] 云端任务导入失败', err);
-                        button.textContent = '🔁 重试导入';
-                        showStatus('error', `❌ 任务导入失败：${err.message}`);
-                    } finally {
-                        button.disabled = importingCloudTasks || libraryList.some(item => item.taskId === task.task_id);
-                    }
-                });
+                } else if (expired) {
+                    button.textContent = '🕒 链接已过期';
+                    button.disabled = true;
+                } else {
+                    button.textContent = '📥 导入本地库';
+                    button.disabled = importingCloudTasks;
+                    button.addEventListener('click', async event => {
+                        event.stopPropagation();
+                        button.disabled = true;
+                        button.textContent = '⏳ 导入中';
+                        try {
+                            await importCloudTask(task);
+                            button.textContent = libraryList.some(item => item.taskId === task.task_id) ? '✅ 已导入' : '⚠️ 远程保留';
+                        } catch (err) {
+                            console.warn('[Gitee AI Generator] 云端任务导入失败', err);
+                            if (/404|expired|过期/i.test(err.message)) {
+                                cloudTaskExpired.add(task.task_id);
+                                renderCloudTasks();
+                                showStatus('loading', `🕒 该任务结果链接已过期，无法导入`);
+                            } else {
+                                button.textContent = '🔁 重试导入';
+                                showStatus('error', `❌ 任务导入失败：${err.message}`);
+                            }
+                        } finally {
+                            button.disabled = importingCloudTasks || libraryList.some(item => item.taskId === task.task_id);
+                        }
+                    });
+                }
                 card.appendChild(button);
             }
             cloudTaskStrip.appendChild(card);
@@ -2606,7 +2626,16 @@
         const url = cloudTaskOutputUrl(task);
         if (!url) throw new Error('成功任务缺少结果地址');
         const kind = mediaKind(url, '');
-        const blob = await requestBlob(url);
+        let blob;
+        try {
+            blob = await requestBlob(url);
+        } catch (error) {
+            if (/404/.test(error.message)) {
+                cloudTaskExpired.add(task.task_id);
+                throw new Error('结果签名链接已过期或失效（HTTP 404）');
+            }
+            throw error;
+        }
         await saveLibraryItem({
             blob,
             sourceUrl: url,
@@ -2636,6 +2665,7 @@
             });
             cloudTaskQuota = quota.status >= 200 && quota.status < 300 ? quota.data : null;
             await fetchAllCloudTasks(token);
+            resetCloudTaskExpired();
             renderCloudTasks();
             if (!silent) showStatus('success', `✅ 已加载 ${cloudTasks.length} 条云端任务`);
         } catch (error) {
@@ -2650,7 +2680,11 @@
     async function importAllSuccessfulTasks() {
         if (importingCloudTasks) return;
         const tasks = cloudTasks.filter(task => task.status === 'success' &&
-            cloudTaskOutputUrl(task) && !libraryList.some(item => item.taskId === task.task_id));
+            cloudTaskOutputUrl(task) && !libraryList.some(item => item.taskId === task.task_id) &&
+            !cloudTaskLinkExpired(task));
+        const skippedExpired = cloudTasks.filter(task => task.status === 'success' &&
+            cloudTaskOutputUrl(task) && !libraryList.some(item => item.taskId === task.task_id) &&
+            cloudTaskLinkExpired(task)).length;
         if (!tasks.length) return;
         importingCloudTasks = true;
         importSuccessBtn.disabled = true;
@@ -2670,11 +2704,22 @@
         showStatus(completed === tasks.length ? 'success' : 'loading',
             completed === tasks.length
                 ? `✅ 已导入 ${completed} 个云端产物`
-                : `⚠️ 已导入 ${completed}/${tasks.length} 个；失败项可能是签名链接过期`);
+                : `⚠️ 已导入 ${completed}/${tasks.length} 个${skippedExpired ? `；${skippedExpired} 个链接已过期` : ''}`);
         setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2500);
     }
 
     refreshTasksBtn.addEventListener('click', () => loadCloudTasks());
+
+    function cloudTaskLinkExpired(task) {
+        if (!task) return false;
+        if (cloudTaskExpired.has(task.task_id)) return true;
+        const ts = Number(task.completed_at || task.created_at || 0);
+        return ts > 0 && Date.now() - ts > CLOUD_TASK_LINK_TTL;
+    }
+
+    function resetCloudTaskExpired() {
+        cloudTaskExpired = new Set();
+    }
     importSuccessBtn.addEventListener('click', importAllSuccessfulTasks);
 
     function hideResultMedia() {
