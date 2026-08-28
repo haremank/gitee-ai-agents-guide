@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.1
+// @version      2.9.2
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -251,6 +251,7 @@
     let cloudTaskQuota = null;
     let importingCloudTasks = false;
     let cloudTaskExpired = new Set();
+    let cloudTaskDismissed = new Set();
     const CLOUD_TASK_LINK_TTL = 24 * 60 * 60 * 1000;
     try {
         const savedHist = safeGM.getValue(STORAGE_HISTORY_KEY, '') || localStorage.getItem(STORAGE_HISTORY_KEY);
@@ -1205,6 +1206,21 @@
             cursor: pointer;
         }
         .zimg-cloud-import:disabled { opacity: .55; cursor: wait; }
+        .zimg-cloud-actions { display: flex; gap: 4px; margin-top: 6px; }
+        .zimg-cloud-actions > button {
+            flex: 1;
+            height: 24px;
+            margin-top: 0;
+            border: 0;
+            border-radius: 5px;
+            color: #fff !important;
+            font-size: 10px;
+            cursor: pointer;
+        }
+        .zimg-cloud-action-preview { background: #4f46e5; }
+        .zimg-cloud-action-cancel { background: #dc2626; }
+        .zimg-cloud-action-dismiss { background: #64748b; }
+        .zimg-cloud-actions > button:disabled { opacity: .55; cursor: wait; }
         .zimg-cloud-status-success { color: #15803d !important; font-weight: 700; }
         .zimg-cloud-status-failure,
         .zimg-cloud-status-cancelled { color: #dc2626 !important; font-weight: 700; }
@@ -2520,6 +2536,7 @@
         cloudTasks = items.filter(task => {
             const id = task.task_id;
             if (!id || seen.has(id)) return false;
+            if (cloudTaskDismissed.has(id)) return false;
             seen.add(id);
             return true;
         });
@@ -2582,25 +2599,36 @@
             if (task.status === 'success' && cloudTaskOutputUrl(task)) {
                 const imported = libraryList.some(item => item.taskId === task.task_id);
                 const expired = imported ? false : cloudTaskLinkExpired(task);
-                const button = document.createElement('button');
-                button.type = 'button';
-                button.className = 'zimg-cloud-import';
+                const actions = document.createElement('div');
+                actions.className = 'zimg-cloud-actions';
+                const previewBtn = document.createElement('button');
+                previewBtn.type = 'button';
+                previewBtn.className = 'zimg-cloud-action-preview';
+                previewBtn.textContent = '👁 预览';
+                previewBtn.addEventListener('click', event => {
+                    event.stopPropagation();
+                    previewCloudTask(task);
+                });
+                actions.appendChild(previewBtn);
+                const importButton = document.createElement('button');
+                importButton.type = 'button';
+                importButton.className = 'zimg-cloud-import';
                 if (imported) {
-                    button.textContent = '✅ 已在本地库';
-                    button.disabled = true;
+                    importButton.textContent = '✅ 已在库';
+                    importButton.disabled = true;
                 } else if (expired) {
-                    button.textContent = '🕒 链接已过期';
-                    button.disabled = true;
+                    importButton.textContent = '🕒 已过期';
+                    importButton.disabled = true;
                 } else {
-                    button.textContent = '📥 导入本地库';
-                    button.disabled = importingCloudTasks;
-                    button.addEventListener('click', async event => {
+                    importButton.textContent = '📥 导入';
+                    importButton.disabled = importingCloudTasks;
+                    importButton.addEventListener('click', async event => {
                         event.stopPropagation();
-                        button.disabled = true;
-                        button.textContent = '⏳ 导入中';
+                        importButton.disabled = true;
+                        importButton.textContent = '⏳ 导入中';
                         try {
                             await importCloudTask(task);
-                            button.textContent = libraryList.some(item => item.taskId === task.task_id) ? '✅ 已导入' : '⚠️ 远程保留';
+                            importButton.textContent = libraryList.some(item => item.taskId === task.task_id) ? '✅ 已导入' : '⚠️ 远程保留';
                         } catch (err) {
                             console.warn('[Gitee AI Generator] 云端任务导入失败', err);
                             if (/404|expired|过期/i.test(err.message)) {
@@ -2608,15 +2636,61 @@
                                 renderCloudTasks();
                                 showStatus('loading', `🕒 该任务结果链接已过期，无法导入`);
                             } else {
-                                button.textContent = '🔁 重试导入';
+                                importButton.textContent = '🔁 重试';
                                 showStatus('error', `❌ 任务导入失败：${err.message}`);
                             }
                         } finally {
-                            button.disabled = importingCloudTasks || libraryList.some(item => item.taskId === task.task_id);
+                            importButton.disabled = importingCloudTasks || libraryList.some(item => item.taskId === task.task_id);
                         }
                     });
                 }
-                card.appendChild(button);
+                actions.appendChild(importButton);
+                const dismissBtn = document.createElement('button');
+                dismissBtn.type = 'button';
+                dismissBtn.className = 'zimg-cloud-action-dismiss';
+                dismissBtn.textContent = '✕ 移除';
+                dismissBtn.title = '从当前任务列表移除（不影响服务端）';
+                dismissBtn.addEventListener('click', event => {
+                    event.stopPropagation();
+                    dismissCloudTask(task.task_id);
+                });
+                actions.appendChild(dismissBtn);
+                card.appendChild(actions);
+            } else if (task.status === 'waiting' || task.status === 'in_progress') {
+                const actions = document.createElement('div');
+                actions.className = 'zimg-cloud-actions';
+                const cancelBtn = document.createElement('button');
+                cancelBtn.type = 'button';
+                cancelBtn.className = 'zimg-cloud-action-cancel';
+                cancelBtn.textContent = '⛔ 取消任务';
+                cancelBtn.addEventListener('click', async event => {
+                    event.stopPropagation();
+                    cancelBtn.disabled = true;
+                    cancelBtn.textContent = '⏳ 取消中';
+                    try {
+                        await cancelCloudTask(task);
+                        showStatus('success', `✅ 已取消任务 ${shortTaskId(task.task_id)}`);
+                    } catch (err) {
+                        cancelBtn.disabled = false;
+                        cancelBtn.textContent = '⛔ 取消任务';
+                        showStatus('error', `❌ 取消失败：${err.message}`);
+                    }
+                });
+                actions.appendChild(cancelBtn);
+                card.appendChild(actions);
+            } else {
+                const actions = document.createElement('div');
+                actions.className = 'zimg-cloud-actions';
+                const dismissBtn = document.createElement('button');
+                dismissBtn.type = 'button';
+                dismissBtn.className = 'zimg-cloud-action-dismiss';
+                dismissBtn.textContent = '✕ 移除';
+                dismissBtn.addEventListener('click', event => {
+                    event.stopPropagation();
+                    dismissCloudTask(task.task_id);
+                });
+                actions.appendChild(dismissBtn);
+                card.appendChild(actions);
             }
             cloudTaskStrip.appendChild(card);
         });
@@ -2721,6 +2795,63 @@
         cloudTaskExpired = new Set();
     }
     importSuccessBtn.addEventListener('click', importAllSuccessfulTasks);
+
+    async function previewCloudTask(task) {
+        const url = cloudTaskOutputUrl(task);
+        if (!url) {
+            showStatus('error', '❌ 该任务没有可预览的结果地址');
+            return;
+        }
+        try {
+            const kind = mediaKind(url, '');
+            const ext = extFromUrl(url, { video: 'mp4', audio: 'mpeg', model: 'glb' }[kind] || 'bin');
+            const result = {
+                kind,
+                ext,
+                sourceUrl: url,
+                filename: `gitee-ai-cloud-${kind}-${task.task_id}.${ext}`
+            };
+            const blob = await requestBlob(url);
+            releaseCurrentObjectUrl();
+            const objectUrl = URL.createObjectURL(blob);
+            result.url = objectUrl;
+            showResult(result, '(云端异步任务预览)');
+            currentObjectUrl = objectUrl;
+            showStatus('loading', '👁 正在预览云端任务结果（未保存到本地库）');
+            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2000);
+        } catch (error) {
+            if (/404|expired|过期/i.test(error.message)) {
+                cloudTaskExpired.add(task.task_id);
+                renderCloudTasks();
+                showStatus('loading', '🕒 该任务结果链接已过期，无法预览');
+            } else {
+                showStatus('error', `❌ 预览失败：${error.message}`);
+            }
+        }
+    }
+
+    async function cancelCloudTask(task) {
+        const token = cleanToken(tokenInput.value);
+        if (!token) throw new Error('请先填写或同步访问令牌');
+        const cancelUrl = (task.urls && task.urls.cancel) || `${API_BASE}/v1/task/${encodeURIComponent(task.task_id)}/cancel`;
+        const response = await requestJson({
+            method: 'POST',
+            url: cancelUrl,
+            headers: { Authorization: `Bearer ${token}` }
+        });
+        if (response.status < 200 || response.status >= 300) {
+            throw new Error(requestErrorMessage(response.status, response.data));
+        }
+        cloudTaskDismissed.add(task.task_id);
+        await loadCloudTasks({ silent: true });
+    }
+
+    function dismissCloudTask(taskId) {
+        if (!taskId) return;
+        cloudTaskDismissed.add(taskId);
+        cloudTasks = cloudTasks.filter(t => t.task_id !== taskId);
+        renderCloudTasks();
+    }
 
     function hideResultMedia() {
         [previewImg, previewVideo, previewAudio, previewFileCard, previewText].forEach(node => {
