@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.2
+// @version      2.9.3
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -121,9 +121,14 @@
 
     const STORAGE_TOKEN_KEY = 'gitee_ai_custom_token';
     const STORAGE_HISTORY_KEY = 'gitee_ai_zimage_history';
+    const STORAGE_DISMISSED_CLOUD_TASKS_KEY = 'gitee_ai_dismissed_cloud_tasks';
     const LIBRARY_DB_NAME = 'gitee-ai-workbench-library';
     const LIBRARY_DB_VERSION = 1;
     const LIBRARY_STORE = 'items';
+    const SETTINGS_DB_NAME = 'gitee-ai-workbench-settings';
+    const SETTINGS_DB_VERSION = 1;
+    const SETTINGS_STORE = 'handles';
+    const SETTINGS_DIRECTORY_KEY = 'downloadDirectory';
     const STORAGE_FAB_POS = 'gitee_ai_zimage_fab_pos';
     const STORAGE_QUOTA_KEY = 'gitee_ai_zimage_live_quota';
     const API_BASE = "https://ai.gitee.com";
@@ -246,6 +251,9 @@
     let libraryFilter = 'all';
     let libraryQuery = '';
     let libraryObjectUrls = [];
+    let settingsDbReady = null;
+    let downloadDirectoryHandle = null;
+    let downloadDirectoryNeedsPermission = false;
     let cloudTasks = [];
     let cloudTaskTotal = 0;
     let cloudTaskQuota = null;
@@ -253,6 +261,11 @@
     let cloudTaskExpired = new Set();
     let cloudTaskDismissed = new Set();
     const CLOUD_TASK_LINK_TTL = 24 * 60 * 60 * 1000;
+    try {
+        const savedDismissed = safeGM.getValue(STORAGE_DISMISSED_CLOUD_TASKS_KEY, '[]');
+        const parsed = JSON.parse(savedDismissed || '[]');
+        if (Array.isArray(parsed)) cloudTaskDismissed = new Set(parsed.filter(Boolean).map(String));
+    } catch (_) {}
     try {
         const savedHist = safeGM.getValue(STORAGE_HISTORY_KEY, '') || localStorage.getItem(STORAGE_HISTORY_KEY);
         if (savedHist) historyList = JSON.parse(savedHist);
@@ -295,6 +308,69 @@
             tx.onerror = () => reject(tx.error || new Error('本地库读写失败'));
             tx.onabort = () => reject(tx.error || new Error('本地库操作被中断'));
         }));
+    }
+
+    function openSettingsDb() {
+        if (settingsDbReady) return settingsDbReady;
+        settingsDbReady = new Promise((resolve) => {
+            if (typeof indexedDB === 'undefined' || !indexedDB) {
+                resolve(null);
+                return;
+            }
+            const request = indexedDB.open(SETTINGS_DB_NAME, SETTINGS_DB_VERSION);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(SETTINGS_STORE)) {
+                    db.createObjectStore(SETTINGS_STORE, { keyPath: 'key' });
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => resolve(null);
+        });
+        return settingsDbReady;
+    }
+
+    async function withSettingsStore(mode, callback) {
+        const db = await openSettingsDb();
+        if (!db) throw new Error('设置库不可用');
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(SETTINGS_STORE, mode);
+            const request = callback(tx.objectStore(SETTINGS_STORE));
+            tx.oncomplete = () => resolve(request && 'result' in request ? request.result : undefined);
+            tx.onerror = () => reject(tx.error || new Error('设置库读写失败'));
+            tx.onabort = () => reject(tx.error || new Error('设置库操作被中断'));
+        });
+    }
+
+    async function getStoredDownloadDirectory() {
+        try {
+            const row = await withSettingsStore('readonly', store => store.get(SETTINGS_DIRECTORY_KEY));
+            return row && row.value ? row.value : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    async function storeDownloadDirectory(handle) {
+        await withSettingsStore('readwrite', store => store.put({ key: SETTINGS_DIRECTORY_KEY, value: handle }));
+    }
+
+    async function removeStoredDownloadDirectory() {
+        await withSettingsStore('readwrite', store => store.delete(SETTINGS_DIRECTORY_KEY));
+    }
+
+    async function hasDirectoryPermission(handle, request = false) {
+        if (!handle) return false;
+        try {
+            const options = { mode: 'readwrite' };
+            let state = await handle.queryPermission(options);
+            if (state === 'granted') return true;
+            if (!request) return false;
+            state = await handle.requestPermission(options);
+            return state === 'granted';
+        } catch (_) {
+            return false;
+        }
     }
 
     function hashString(value) {
@@ -1813,11 +1889,23 @@
                     </div>
                 </div>
 
+                <!-- 自动保存目录设置 -->
+                <div class="zimg-field" id="zimg-save-directory-section">
+                    <div class="zimg-label-row">
+                        <span class="zimg-label">💾 自动保存目录</span>
+                        <span class="zimg-label-sub" id="zimg-save-dir-status">检查浏览器支持…</span>
+                    </div>
+                    <div class="zimg-library-controls" style="grid-template-columns:auto auto;">
+                        <button class="zimg-small-btn" id="zimg-btn-choose-save-dir">📁 选择目录</button>
+                        <button class="zimg-small-btn" id="zimg-btn-clear-save-dir" disabled>🗑 清除目录</button>
+                    </div>
+                </div>
+
                 <!-- 历史生成画廊 -->
                 <div class="zimg-field" id="zimg-cloud-task-section">
                     <div class="zimg-label-row">
                         <span class="zimg-label">☁️ 云端异步任务 <span class="zimg-label-sub" id="zimg-cloud-task-count"></span></span>
-                        <span class="zimg-label-sub">近 7 天 · 官方任务列表</span>
+                        <span class="zimg-label-sub">近 24 小时 · 官方任务列表</span>
                     </div>
                     <div class="zimg-library-controls" style="grid-template-columns:auto auto;">
                         <button class="zimg-small-btn" id="zimg-btn-refresh-tasks">🔄 刷新云端任务</button>
@@ -1958,6 +2046,9 @@
     const libraryCount = document.getElementById('zimg-library-count');
     const librarySearch = document.getElementById('zimg-library-search');
     const libraryType = document.getElementById('zimg-library-type');
+    const chooseSaveDirBtn = document.getElementById('zimg-btn-choose-save-dir');
+    const clearSaveDirBtn = document.getElementById('zimg-btn-clear-save-dir');
+    const saveDirStatus = document.getElementById('zimg-save-dir-status');
     const cloudTaskCount = document.getElementById('zimg-cloud-task-count');
     const cloudTaskSummary = document.getElementById('zimg-cloud-task-summary');
     const cloudTaskStrip = document.getElementById('zimg-cloud-task-strip');
@@ -2259,7 +2350,155 @@
         await withLibrary('readwrite', store => store.put(record));
         libraryList.unshift(record);
         renderLibrary();
+        if (downloadDirectoryHandle) {
+            try {
+                await saveRecordToDirectory(record);
+            } catch (error) {
+                console.warn('[Gitee AI Generator] 自动保存到目录失败', error);
+                renderSaveDirectoryState(`保存失败：${error.message}`);
+            }
+        }
         return record.id;
+    }
+
+    function sanitizeFilename(value, fallback = 'gitee-ai-output') {
+        const name = String(value || '')
+            .split(/[\\/]/).pop()
+            .replace(/[<>:"|?*\u0000-\u001f]/g, '_')
+            .replace(/^\.+/, '')
+            .trim()
+            .slice(0, 180)
+            .trim();
+        return name || fallback;
+    }
+
+    async function uniqueDirectoryFilename(handle, filename, ext) {
+        const safe = sanitizeFilename(filename || `gitee-ai-${Date.now()}.${ext || 'bin'}`);
+        const dot = safe.lastIndexOf('.');
+        const base = dot > 0 ? safe.slice(0, dot) : safe;
+        const extension = dot > 0 ? safe.slice(dot) : (ext ? `.${ext}` : '');
+        for (let index = 0; index < 1000; index += 1) {
+            const candidate = index ? `${base}-${index}${extension}` : safe;
+            try {
+                await handle.getFileHandle(candidate, { create: false });
+            } catch (error) {
+                if (error && error.name === 'NotFoundError') return candidate;
+                throw error;
+            }
+        }
+        throw new Error('无法生成不重复的文件名');
+    }
+
+    async function saveRecordToDirectory(record) {
+        if (!downloadDirectoryHandle || !record.blob) return false;
+        if (!(await hasDirectoryPermission(downloadDirectoryHandle))) {
+            downloadDirectoryNeedsPermission = true;
+            renderSaveDirectoryState('目录权限不足');
+            throw new Error('需要重新授权保存目录');
+        }
+        const filename = await uniqueDirectoryFilename(downloadDirectoryHandle, record.filename, record.ext);
+        const fileHandle = await downloadDirectoryHandle.getFileHandle(filename, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(record.blob);
+        await writable.close();
+        record.savedFilename = filename;
+        await withLibrary('readwrite', store => store.put(record));
+        const existing = libraryList.find(item => item.id === record.id);
+        if (existing) existing.savedFilename = filename;
+        renderSaveDirectoryState(`最近已保存 ${filename}`);
+        return true;
+    }
+
+    async function deleteRecordFile(record) {
+        const filename = record && record.savedFilename;
+        if (!downloadDirectoryHandle || !filename) return true;
+        if (!(await hasDirectoryPermission(downloadDirectoryHandle, true))) {
+            downloadDirectoryNeedsPermission = true;
+            renderSaveDirectoryState('目录权限不足');
+            return false;
+        }
+        try {
+            await downloadDirectoryHandle.removeEntry(filename);
+            renderSaveDirectoryState(`已删除 ${filename}`);
+            return true;
+        } catch (error) {
+            if (error && error.name === 'NotFoundError') return true;
+            renderSaveDirectoryState(`删除失败：${error.message}`);
+            return false;
+        }
+    }
+
+    function persistDismissedCloudTasks() {
+        const values = Array.from(cloudTaskDismissed).slice(-1000);
+        safeGM.setValue(STORAGE_DISMISSED_CLOUD_TASKS_KEY, JSON.stringify(values));
+    }
+
+    function renderSaveDirectoryState(message = '') {
+        if (!saveDirStatus) return;
+        const supported = typeof window.showDirectoryPicker === 'function';
+        let text;
+        if (!supported) {
+            text = '当前浏览器不支持固定目录（仍保存到浏览器本地库）';
+        } else if (!downloadDirectoryHandle) {
+            text = '未设置（生成内容仍保存到浏览器本地库）';
+        } else {
+            text = `${downloadDirectoryHandle.name}${downloadDirectoryNeedsPermission ? ' · 需要重新授权' : ''}`;
+        }
+        if (message) text += ` · ${message}`;
+        saveDirStatus.textContent = text;
+        if (chooseSaveDirBtn) {
+            chooseSaveDirBtn.disabled = !supported;
+            chooseSaveDirBtn.textContent = supported && downloadDirectoryNeedsPermission ? '🔑 重新授权' : '📁 选择目录';
+        }
+        if (clearSaveDirBtn) clearSaveDirBtn.disabled = !supported || !downloadDirectoryHandle;
+    }
+
+    async function restoreDownloadDirectory() {
+        try {
+            const handle = await getStoredDownloadDirectory();
+            downloadDirectoryHandle = handle;
+            downloadDirectoryNeedsPermission = handle ? !(await hasDirectoryPermission(handle)) : false;
+        } catch (error) {
+            console.warn('[Gitee AI Generator] 恢复自动保存目录失败', error);
+        } finally {
+            renderSaveDirectoryState();
+        }
+    }
+
+    async function chooseDownloadDirectory() {
+        if (typeof window.showDirectoryPicker !== 'function') {
+            showStatus('error', '❌ 当前浏览器不支持选择固定目录，请使用 Chrome / Edge 等基于 Chromium 的浏览器');
+            return;
+        }
+        try {
+            const handle = await window.showDirectoryPicker({ mode: 'readwrite', id: 'gitee-ai-workbench' });
+            const granted = await hasDirectoryPermission(handle, true);
+            if (!granted) throw new Error('未授予目录写入权限');
+            downloadDirectoryHandle = handle;
+            downloadDirectoryNeedsPermission = false;
+            await storeDownloadDirectory(handle);
+            renderSaveDirectoryState();
+            showStatus('success', '✅ 新生成内容将自动保存到此目录');
+            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2000);
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+            console.error('[Gitee AI Generator] 选择保存目录失败', error);
+            showStatus('error', `❌ 选择保存目录失败：${error.message}`);
+        }
+    }
+
+    async function clearDownloadDirectory() {
+        try {
+            await removeStoredDownloadDirectory();
+            downloadDirectoryHandle = null;
+            downloadDirectoryNeedsPermission = false;
+            renderSaveDirectoryState();
+            showStatus('success', '✅ 已清除自动保存目录');
+            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 1500);
+        } catch (error) {
+            console.error('[Gitee AI Generator] 清除保存目录失败', error);
+            showStatus('error', `❌ 清除保存目录失败：${error.message}`);
+        }
     }
 
     async function migrateLegacyHistory() {
@@ -2445,6 +2684,15 @@
 
     async function deleteLibraryItem(id) {
         try {
+            const record = await getLibraryItem(id);
+            if (!record) {
+                await refreshLibrary();
+                return;
+            }
+            if (record.savedFilename && downloadDirectoryHandle &&
+                !(await deleteRecordFile(record))) {
+                throw new Error('目录文件删除失败，请重新授权保存目录');
+            }
             await withLibrary('readwrite', store => store.delete(id));
             await refreshLibrary();
             showStatus('success', '🗑 已删除这条本地记录');
@@ -2466,6 +2714,13 @@
     clearHistoryBtn.addEventListener('click', async () => {
         if (!confirm(`确定清空本地库中的 ${libraryList.length} 条生成内容？此操作不可恢复。`)) return;
         try {
+            const records = [...libraryList];
+            for (const record of records) {
+                if (record.savedFilename && downloadDirectoryHandle &&
+                    !(await deleteRecordFile(record))) {
+                    throw new Error('目录文件删除失败，已保留本地记录');
+                }
+            }
             await withLibrary('readwrite', store => store.clear());
             historyList = [];
             safeGM.setValue(STORAGE_HISTORY_KEY, '[]');
@@ -2478,6 +2733,10 @@
             showStatus('error', `❌ 本地库清空失败：${error.message}`);
         }
     });
+
+    chooseSaveDirBtn.addEventListener('click', chooseDownloadDirectory);
+    clearSaveDirBtn.addEventListener('click', clearDownloadDirectory);
+    restoreDownloadDirectory();
 
     function extFromUrl(url, fallback) {
         try {
@@ -2506,6 +2765,23 @@
         return Number.isFinite(date.getTime()) ? date.toLocaleString() : String(value);
     }
 
+    function cloudTaskTimestamp(task) {
+        const value = (task && (task.created_at || task.completed_at)) || null;
+        if (value === null || value === undefined || value === '') return NaN;
+        const timestamp = typeof value === 'number' ? value : new Date(value).getTime();
+        if (!Number.isFinite(timestamp)) return NaN;
+        return timestamp < 1e12 ? timestamp * 1000 : timestamp;
+    }
+
+    function cloudTaskDisplayTimestamp(task) {
+        return task.created_at || task.completed_at;
+    }
+
+    function isCloudTaskInWindow(task, cutoff) {
+        const timestamp = cloudTaskTimestamp(task);
+        return Number.isFinite(timestamp) && timestamp >= cutoff;
+    }
+
     function cloudTaskErrorMessage(task) {
         return task.message || (task.error && (task.error.message || task.error)) || '无详细原因';
     }
@@ -2523,6 +2799,7 @@
         let items = Array.isArray(first.data.items) ? first.data.items : [];
         const total = Number(first.data.total);
         const pages = Math.min(5, Math.ceil(Number.isFinite(total) ? total / pageSize : 1));
+        const cutoff = Date.now() - CLOUD_TASK_LINK_TTL;
         for (let page = 2; page <= pages; page += 1) {
             const next = await requestJson({
                 method: 'GET',
@@ -2530,17 +2807,20 @@
                 headers: { Authorization: `Bearer ${token}` }
             });
             if (next.status < 200 || next.status >= 300) break;
-            items = items.concat(Array.isArray(next.data.items) ? next.data.items : []);
+            const nextItems = Array.isArray(next.data.items) ? next.data.items : [];
+            items = items.concat(nextItems);
+            if (nextItems.length && nextItems.every(task => !isCloudTaskInWindow(task, cutoff))) break;
         }
         const seen = new Set();
         cloudTasks = items.filter(task => {
             const id = task.task_id;
             if (!id || seen.has(id)) return false;
             if (cloudTaskDismissed.has(id)) return false;
+            if (!isCloudTaskInWindow(task, cutoff)) return false;
             seen.add(id);
             return true;
         });
-        cloudTaskTotal = Number.isFinite(total) ? total : cloudTasks.length;
+        cloudTaskTotal = cloudTasks.length;
     }
 
     function renderCloudTasks(error = '') {
@@ -2577,7 +2857,7 @@
         if (!cloudTasks.length) {
             const empty = document.createElement('div');
             empty.className = 'zimg-library-empty';
-            empty.textContent = '暂无近 7 天异步任务，或尚未刷新';
+            empty.textContent = '暂无近 24 小时异步任务，或尚未刷新';
             cloudTaskStrip.appendChild(empty);
             return;
         }
@@ -2594,7 +2874,7 @@
             status.textContent = statusLabels[task.status] || task.status || '未知';
             const time = document.createElement('div');
             time.className = 'zimg-cloud-meta';
-            time.textContent = formatCloudTime(task.created_at || task.completed_at);
+            time.textContent = formatCloudTime(cloudTaskDisplayTimestamp(task));
             card.append(id, status, time);
             if (task.status === 'success' && cloudTaskOutputUrl(task)) {
                 const imported = libraryList.some(item => item.taskId === task.task_id);
@@ -2843,12 +3123,14 @@
             throw new Error(requestErrorMessage(response.status, response.data));
         }
         cloudTaskDismissed.add(task.task_id);
+        persistDismissedCloudTasks();
         await loadCloudTasks({ silent: true });
     }
 
     function dismissCloudTask(taskId) {
         if (!taskId) return;
         cloudTaskDismissed.add(taskId);
+        persistDismissedCloudTasks();
         cloudTasks = cloudTasks.filter(t => t.task_id !== taskId);
         renderCloudTasks();
     }
@@ -4173,6 +4455,11 @@
         try {
             token = validateToken();
             beginGeneration();
+            if (downloadDirectoryHandle && downloadDirectoryNeedsPermission) {
+                const granted = await hasDirectoryPermission(downloadDirectoryHandle, true);
+                downloadDirectoryNeedsPermission = !granted;
+                renderSaveDirectoryState();
+            }
             if (currentMode === 'image') {
                 const prompt = requirePrompt();
                 const payload = buildImagePayload(prompt);
