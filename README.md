@@ -1,7 +1,7 @@
 # Gitee AI 多模型生成工作台
 
 [![GitHub](https://img.shields.io/badge/GitHub-haremank%2Fgitee--ai--agents--guide-blue?style=flat&logo=github)](https://github.com/haremank/gitee-ai-agents-guide)
-[![Version](https://img.shields.io/badge/版本-v2.9.8-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
+[![Version](https://img.shields.io/badge/版本-v2.9.9-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
 [![Usage](https://img.shields.io/badge/用途-仅限个人学习-red)](https://github.com/haremank/gitee-ai-agents-guide#readme)
 
 基于 Tampermonkey 的油猴脚本：在任意网页提供可拖拽的多模型生成面板，自动获取令牌与额度，支持异步任务轮询、结果预览下载与 Agent 提示词一键导出。

@@ -44,7 +44,8 @@ const bundle = [
     extractFunction('formatBytes'),
     extractFunction('sanitizeFilename'),
     extractFunction('shortTaskId'),
-    'return { safeTaskUrl, cloudTaskTimestamp, isHttpUrl, extFallback, extFromUrl, mediaKind, formatBytes, sanitizeFilename, shortTaskId };'
+    extractFunction('playableMediaBlob'),
+    'return { safeTaskUrl, cloudTaskTimestamp, isHttpUrl, extFallback, extFromUrl, mediaKind, formatBytes, sanitizeFilename, shortTaskId, playableMediaBlob };'
 ].join('\n');
 
 const fns = new Function(bundle)();
@@ -129,4 +130,15 @@ test('shortTaskId: 长任务 ID 缩略，短 ID 原样', () => {
     assert.ok(short.length < 14);
     assert.equal(fns.shortTaskId('ABC123'), 'ABC123');
     assert.equal(fns.shortTaskId(''), '(无 ID)');
+});
+
+test('playableMediaBlob: octet-stream 按记录 mime 重打类型，其余原样', () => {
+    const raw = new Blob([new Uint8Array([1, 2, 3])], { type: 'application/octet-stream' });
+    const fixed = fns.playableMediaBlob(raw, 'video/mp4');
+    assert.equal(fixed.type, 'video/mp4');
+    assert.equal(fixed.size, 3);
+    const ok = new Blob([new Uint8Array([1])], { type: 'video/mp4' });
+    assert.equal(fns.playableMediaBlob(ok, 'video/mp4'), ok);
+    assert.equal(fns.playableMediaBlob(raw, ''), raw);
+    assert.equal(fns.playableMediaBlob(null, 'video/mp4'), null);
 });

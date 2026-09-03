@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.8
+// @version      2.9.9
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -456,18 +456,25 @@
         return types[String(ext || '').toLowerCase()] || 'application/octet-stream';
     }
 
-    async function requestBlob(url) {
+    async function requestBlob(url, extHint) {
         if (!url) throw new Error('结果地址为空');
+        // octet-stream/缺失类型会让 <video>/<audio> 拒绝播放 objectURL；优先 URL 扩展名，其次调用方提示的扩展名
+        const inferMime = () => mimeForExt(extFromUrl(url, '')) || mimeForExt(extHint || '') || 'application/octet-stream';
+        const retype = (blob) => {
+            const type = String(blob.type || '');
+            if (type && type !== 'application/octet-stream') return blob;
+            return blob.slice(0, blob.size, inferMime());
+        };
         if (/^data:/i.test(url)) {
             const response = await fetch(url);
             if (!response.ok) throw new Error(`本地数据读取失败：HTTP ${response.status}`);
-            return response.blob();
+            return retype(await response.blob());
         }
         try {
             const response = await fetch(url, { mode: 'cors', credentials: 'omit' });
             if (response.ok) {
                 const blob = await response.blob();
-                if (blob.size > 0) return blob;
+                if (blob.size > 0) return retype(blob);
             }
         } catch (_) {}
         const response = await makeRequest({
@@ -487,7 +494,8 @@
             const match = rawHeaders.match(/content-type:\s*([^\r\n;]+)/i);
             if (match) mime = match[1].trim();
         } catch (_) {}
-        return new Blob([body], { type: mime || mimeForExt(extFromUrl(url, 'bin')) });
+        if (!mime || /octet-stream/i.test(mime)) mime = inferMime();
+        return new Blob([body], { type: mime });
     }
 
     function waitForMedia(element, eventName, url) {
@@ -2416,7 +2424,7 @@
             localState = 'saved';
         } else if (result.url) {
             try {
-                blob = await requestBlob(result.url);
+                blob = await requestBlob(result.url, result.ext);
                 mime = blob.type && blob.type !== 'application/octet-stream' ? blob.type : mime;
                 localState = 'saved';
             } catch (error) {
@@ -2823,6 +2831,20 @@
         }
     }
 
+    // 老记录的 blob 可能带着 BOS 返回的 application/octet-stream 错误类型，<video>/<audio> 会拒绝播放；
+    // 按记录里存的 mime（由扩展名推导）重打类型，其余情况原样返回
+    function playableMediaBlob(blob, mimeHint) {
+        if (!blob) return blob;
+        const type = String(blob.type || '');
+        if (type && type !== 'application/octet-stream') return blob;
+        if (!mimeHint) return blob;
+        try {
+            return blob.slice(0, blob.size, mimeHint);
+        } catch (_) {
+            return blob;
+        }
+    }
+
     async function openLibraryItem(id) {
         try {
             const item = await getLibraryItem(id);
@@ -2836,8 +2858,18 @@
                 result = { kind: 'text', text: item.text || '', ext: item.ext || 'txt' };
             } else if (item.blob) {
                 releaseCurrentObjectUrl();
-                objectUrl = URL.createObjectURL(item.blob);
+                objectUrl = URL.createObjectURL(playableMediaBlob(item.blob, item.mime));
                 result = { url: objectUrl, kind: item.kind, ext: item.ext, filename: item.filename };
+            } else if ((item.kind === 'video' || item.kind === 'audio') && isHttpUrl(item.sourceUrl)) {
+                // 无本地副本的记录：直链在第三方页面会被防盗链拦截，先取回再播，失败回退直链
+                try {
+                    const blob = await requestBlob(item.sourceUrl, item.ext);
+                    releaseCurrentObjectUrl();
+                    objectUrl = URL.createObjectURL(blob);
+                    result = { url: objectUrl, kind: item.kind, ext: item.ext, filename: item.filename };
+                } catch (_) {
+                    result = { url: item.sourceUrl, kind: item.kind, ext: item.ext, filename: item.filename };
+                }
             } else {
                 result = { url: item.sourceUrl, kind: item.kind, ext: item.ext, filename: item.filename };
             }
@@ -3179,9 +3211,10 @@
         const url = cloudTaskOutputUrl(task);
         if (!url) throw new Error('成功任务缺少结果地址');
         const kind = mediaKind(url, '');
+        const ext = extFromUrl(url, extFallback(kind));
         let blob;
         try {
-            blob = await requestBlob(url);
+            blob = await requestBlob(url, ext);
         } catch (error) {
             if (/404/.test(error.message)) {
                 cloudTaskExpired.add(task.task_id);
@@ -3193,7 +3226,7 @@
             blob,
             sourceUrl: url,
             kind,
-            ext: extFromUrl(url, { video: 'mp4', audio: 'mpeg', model: 'glb' }[kind] || 'bin')
+            ext,
         }, '(云端异步任务)', {
             mode: '',
             model: '',
@@ -3299,14 +3332,14 @@
         }
         try {
             const kind = mediaKind(url, '');
-            const ext = extFromUrl(url, { video: 'mp4', audio: 'mpeg', model: 'glb' }[kind] || 'bin');
+            const ext = extFromUrl(url, extFallback(kind));
             const result = {
                 kind,
                 ext,
                 sourceUrl: url,
                 filename: `gitee-ai-cloud-${kind}-${task.task_id}.${ext}`
             };
-            const blob = await requestBlob(url);
+            const blob = await requestBlob(url, ext);
             releaseCurrentObjectUrl();
             const objectUrl = URL.createObjectURL(blob);
             result.url = objectUrl;
@@ -4751,7 +4784,7 @@
             // 统一先取回内容用 objectURL 播放，失败时回退直链
             if (kind === 'video' || kind === 'audio') {
                 try {
-                    const blob = await requestBlob(url);
+                    const blob = await requestBlob(url, currentResult.ext);
                     playedViaObjectUrl = URL.createObjectURL(blob);
                     currentResult.url = playedViaObjectUrl;
                     currentResult.sourceUrl = url;
