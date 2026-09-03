@@ -1,3 +1,21 @@
+// 把 Gitee AI 抓取的 grouped 参数数据压缩为 assets/gitee-serverless-controls.compact.json。
+//
+// 输入（源数据不在仓库内，需自行从平台抓取后聚合为 grouped JSON，数组每项形如）：
+//   {
+//     path: "/v1/images/generations",
+//     params: [{
+//       param, location, type, required_any, controls, descriptions, defaults, ranges, options,
+//       model_constraints: [{
+//         operation_id, operation_name, model, api_format, price, free_use, status,
+//         required, default, minimum, maximum, step, options, description
+//       }]
+//     }]
+//   }
+// 数据来源：
+//   GET https://ai.gitee.com/v1/models
+//   GET https://ai.gitee.com/v1/json
+//   GET https://ai.gitee.com/api/pay/service/operations?service_ident={model}
+// 用法：node scripts/build-controls-schema.mjs [输入.json] [输出路径]
 import fs from 'node:fs';
 import path from 'node:path';
 

@@ -102,7 +102,7 @@ curl https://ai.gitee.com/v1/task/$TASK_ID -H "Authorization: Bearer $TOKEN"
 ```
 
 3. 响应中的 `status` 字段状态机：
-   - `success` → 终态成功。完整响应示例：`{"task_id":"...","status":"success","output":{"file_url":"https://gitee-ai.su.bcebos.com/..."},"price":0.0,"currency":"CNY","urls":{...}}`，结果取 `output.file_url`（或 `output.url`）；
+   - `success` → 终态成功。完整响应示例：`{"task_id":"...","status":"success","output":{"file_url":"https://gitee-ai.su.bcebos.com/..."},"price":0.0,"currency":"CNY","urls":{...}}`，结果取 `output.file_url`（或 `output.url`）；文本类任务的结果在 `output.text_result`（纯文本，不是 URL）；
    - `failure` / `cancelled` → 终态失败或已取消，原因在 `message` 字段，据此修正参数后可重新提交一次；
    - 其它取值（如 `waiting`）→ 仍在排队 / 处理中，继续轮询，不要提前放弃。
 
@@ -126,7 +126,7 @@ curl https://ai.gitee.com/v1/tasks/available-quota -H "Authorization: Bearer $TO
 
 模型：`HunyuanVideo-1.5`、`Wan2.1-T2V-14B`
 
-JSON 参数：`model`、`prompt`、`num_frames`(如 81)、`num_inference_steps`、`negative_prompt`、`seed`、`aspect_ratio`("16:9"/"9:16"/"1:1")、`fps`(16/24)。文生视频通过画面比例控制构图，最终分辨率由模型决定。
+JSON 参数：`model`、`prompt`、`num_frames`(如 81)、`num_inference_steps`、`negative_prompt`、`seed`、`aspect_ratio`("16:9"/"9:16"/"1:1")、`fps`(16/24)。文生视频通过画面比例控制构图，最终分辨率由模型决定；`aspect_ratio`/`fps` 仅部分模型（如 HunyuanVideo-1.5）支持，Wan2.1 等以模型元数据为准。
 
 ### 2.2 图生视频 — `POST /v1/async/videos/image-to-video`
 
@@ -166,7 +166,7 @@ Hunyuan3D-2 追加：`type`、`num_inference_steps`(2-50)、`octree_resolution`(
 1. **免费优先**：文本、语音识别、语音合成优先选 🆓 模型；图像 / 视频 / 3D 为付费模型，调用前先向使用者确认。
 2. **轮询纪律**：异步任务每 4 秒 GET 一次任务状态，最多 15 分钟；不要小于 1 秒的频率轰炸接口。
 3. **错误处理**：HTTP 401 → 令牌无效，停止重试并提示使用者；429 / 5xx → 指数退避重试（最多 3 次）；其余 4xx 按 message 修正参数。
-4. **产物落地**：结果 URL 直接交给使用者，或下载保存到项目 `output/` 目录；`file_url` 为百度云 BOS 签名链接，有效期约 1 天，需长期保留请及时下载。配套油猴脚本 v2.9.0 会把面板生成结果和云端成功任务额外保留在浏览器 IndexedDB 本地库中，但这不是跨设备备份，Agent 工作流仍应按本条下载重要产物。
+4. **产物落地**：结果 URL 直接交给使用者，或下载保存到项目 `output/` 目录；`file_url` 为百度云 BOS 签名链接，有效期约 1 天，需长期保留请及时下载。配套油猴脚本 v2.9.4 会把面板生成结果和云端成功任务额外保留在浏览器 IndexedDB 本地库中，但这不是跨设备备份，Agent 工作流仍应按本条下载重要产物。
 5. **勿泄露令牌**：不要把 TOKEN 打印到日志、注释或对外输出中。
 
 ## 4. 端点速查表
