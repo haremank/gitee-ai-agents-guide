@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.4
+// @version      2.9.5
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -112,6 +112,7 @@
                     if (opts.onerror) opts.onerror(err);
                 }
             });
+            return { abort: () => controller.abort() };
         }
     };
 
@@ -252,6 +253,8 @@
     let libraryFilter = 'all';
     let libraryQuery = '';
     let libraryObjectUrls = [];
+    // 本地库软上限：超过后在计数旁提示清理建议，不自动删除任何内容
+    const LIBRARY_SOFT_LIMIT = 300;
     let settingsDbReady = null;
     let downloadDirectoryHandle = null;
     let downloadDirectoryNeedsPermission = false;
@@ -520,11 +523,16 @@
         let domQuota = null;
         // 非 Gitee 页面没有额度组件，且全量扫描大页面 DOM 会卡顿，直接使用本地记录
         if (IS_GITEE_HOST) try {
-            // 1. 扫描 DOM 文本节点
-            const elements = Array.from(document.querySelectorAll('*'));
-            for (const el of elements) {
-                const text = (el.innerText || '').trim();
-                if (text.includes('每日免费体验') && text.includes('剩余')) {
+            // 1. 先定位包含标记文案的文本节点，再向上找最小容器读取：
+            //    对全页元素逐个取 innerText 会触发整页布局计算，是大页面的主要卡顿源
+            const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+            let markerNode;
+            while ((markerNode = walker.nextNode())) {
+                if (!markerNode.nodeValue || !markerNode.nodeValue.includes('每日免费体验')) continue;
+                let container = markerNode.parentElement;
+                for (let depth = 0; container && depth < 12; depth += 1, container = container.parentElement) {
+                    const text = container.innerText || '';
+                    if (!text.includes('剩余')) continue;
                     const match = text.match(/(?:每日免费体验|免费体验)[^\d]*(\d+)[^\d]*次[，,\s]*剩余[^\d]*(\d+)[^\d]*次/);
                     if (match) {
                         const total = parseInt(match[1], 10);
@@ -533,11 +541,14 @@
                         break;
                     }
                 }
+                if (domQuota) break;
             }
 
             // 2. 扫描 React Fiber 树
             if (!domQuota) {
-                for (const el of elements.slice(0, 120)) {
+                const allElements = document.getElementsByTagName('*');
+                for (let i = 0; i < allElements.length && i < 120; i += 1) {
+                    const el = allElements[i];
                     const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
                     if (!fiberKey) continue;
                     let curr = el[fiberKey];
@@ -601,15 +612,26 @@
     function syncHostPageQuotaDOM(remaining) {
         if (!IS_GITEE_HOST) return;
         try {
-            const elements = Array.from(document.querySelectorAll('*'));
-            for (const el of elements) {
-                if ((el.innerText || '').includes('每日免费体验') && (el.innerText || '').includes('剩余')) {
-                    const redSpan = el.querySelector('.text-red-600') || el.querySelector('span');
-                    if (redSpan) {
-                        redSpan.innerText = String(remaining);
+            const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+            const containers = new Set();
+            let markerNode;
+            while ((markerNode = walker.nextNode())) {
+                if (!markerNode.nodeValue || !markerNode.nodeValue.includes('每日免费体验')) continue;
+                let container = markerNode.parentElement;
+                for (let depth = 0; container && depth < 12; depth += 1, container = container.parentElement) {
+                    const text = container.innerText || '';
+                    if (text.includes('每日免费体验') && text.includes('剩余')) {
+                        containers.add(container);
+                        break;
                     }
                 }
             }
+            containers.forEach((el) => {
+                const redSpan = el.querySelector('.text-red-600') || el.querySelector('span');
+                if (redSpan) {
+                    redSpan.innerText = String(remaining);
+                }
+            });
         } catch(e) {}
     }
 
@@ -1571,11 +1593,15 @@
         e.preventDefault();
     });
 
+    // window 级监听统一挂同一 signal，卸载时可一并移除
+    const windowListenersAbort = new AbortController();
+    const windowListenerSignal = windowListenersAbort.signal;
+
     window.addEventListener('mousemove', (e) => {
         moveFabDrag(e.clientX, e.clientY);
-    });
+    }, { signal: windowListenerSignal });
 
-    window.addEventListener('mouseup', endFabDrag);
+    window.addEventListener('mouseup', endFabDrag, { signal: windowListenerSignal });
 
     // 触屏设备：拖动时阻止页面滚动，轻点仍可打开面板
     fab.addEventListener('touchstart', (e) => {
@@ -1588,9 +1614,9 @@
         if (moveFabDrag(e.touches[0].clientX, e.touches[0].clientY)) {
             e.preventDefault();
         }
-    }, { passive: false });
+    }, { passive: false, signal: windowListenerSignal });
 
-    window.addEventListener('touchend', endFabDrag);
+    window.addEventListener('touchend', endFabDrag, { signal: windowListenerSignal });
 
     // 模态弹窗构建
     const overlay = document.createElement('div');
@@ -2598,7 +2624,12 @@
         }
         historySection.style.display = 'block';
         const items = libraryList.filter(libraryMatches);
-        libraryCount.textContent = `${items.length} / ${libraryList.length}`;
+        const totalBytes = libraryList.reduce((sum, item) => sum + (item.size || 0), 0);
+        libraryCount.textContent = `${items.length} / ${libraryList.length} · ${formatBytes(totalBytes)}` +
+            (libraryList.length > LIBRARY_SOFT_LIMIT ? ' · 建议清理' : '');
+        libraryCount.title = libraryList.length > LIBRARY_SOFT_LIMIT
+            ? `本地库已有 ${libraryList.length} 条记录，占用约 ${formatBytes(totalBytes)}；可逐条删除或使用“清空本地库”`
+            : '';
         historyStrip.innerHTML = '';
         if (!items.length) {
             const empty = document.createElement('div');
@@ -3241,7 +3272,7 @@
         } else if (overlay.style.display === 'flex') {
             closeModal();
         }
-    });
+    }, { signal: windowListenerSignal });
 
     promptInput.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -4364,10 +4395,21 @@
                 for (const line of lines) handleLine(line);
             };
 
-            safeGM.xmlhttpRequest({
+            // SSE 长回复可能远超固定总时长，改为空闲看门狗：每个数据块重置计时，超 60 秒无新数据即中断；另设 10 分钟总时长兜底
+            const IDLE_TIMEOUT_MS = 60000;
+            let lastActivityAt = Date.now();
+            let requestHandle = null;
+            const streamWatchdog = setInterval(() => {
+                if (Date.now() - lastActivityAt <= IDLE_TIMEOUT_MS) return;
+                clearInterval(streamWatchdog);
+                try { if (requestHandle && requestHandle.abort) requestHandle.abort(); } catch (e) {}
+                reject(new Error('模型输出中断：超过 60 秒未收到新数据'));
+            }, 5000);
+
+            requestHandle = safeGM.xmlhttpRequest({
                 method: 'POST',
                 url: API_BASE + ENDPOINTS.chat,
-                timeout: 120000,
+                timeout: 600000,
                 headers: {
                     Authorization: `Bearer ${token}`,
                     'Content-Type': 'application/json',
@@ -4377,12 +4419,14 @@
                 onprogress: (res) => {
                     try {
                         if (typeof res.responseText === 'string' && res.responseText) {
+                            lastActivityAt = Date.now();
                             generatePhase = '模型输出中';
                             consume(res.responseText);
                         }
                     } catch (e) {}
                 },
                 onload: (res) => {
+                    clearInterval(streamWatchdog);
                     if (pendingLine) {
                         handleLine(pendingLine);
                         pendingLine = '';
@@ -4403,8 +4447,14 @@
                     }
                     resolve({ text: fullText, status: res.status });
                 },
-                onerror: () => reject(new Error('网络请求失败')),
-                ontimeout: () => reject(new Error('请求超时'))
+                onerror: () => {
+                    clearInterval(streamWatchdog);
+                    reject(new Error('网络请求失败'));
+                },
+                ontimeout: () => {
+                    clearInterval(streamWatchdog);
+                    reject(new Error('请求超时'));
+                }
             });
         });
     }
@@ -4795,6 +4845,13 @@
     // 卸载钩子
     window.__Z_IMAGE_DESTROY__ = () => {
         try { persistenceObserver.disconnect(); } catch (e) {}
+        try { windowListenersAbort.abort(); } catch (e) {}
+        try { clearInterval(generateTimer); } catch (e) {}
+        try { releaseCurrentObjectUrl(); } catch (e) {}
+        try {
+            libraryObjectUrls.forEach(url => URL.revokeObjectURL(url));
+            libraryObjectUrls = [];
+        } catch (e) {}
         style.remove();
         fab.remove();
         overlay.remove();
