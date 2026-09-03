@@ -99,6 +99,13 @@ test('mediaKind: 扩展名优先，其次模式，缺省为图片', () => {
     assert.equal(fns.mediaKind('https://cdn.example.com/x', ''), 'image');
 });
 
+test('mediaKind: 无扩展名的签名 URL 按生成模式兜底，视频不得误判为图片', () => {
+    assert.equal(fns.mediaKind('https://gitee-ai.su.bcebos.com/abc123?X-Amz-Signature=x', 'textVideo'), 'video');
+    assert.equal(fns.mediaKind('https://gitee-ai.su.bcebos.com/abc123', 'imageVideo'), 'video');
+    assert.equal(fns.mediaKind('https://gitee-ai.su.bcebos.com/abc123', 'speech'), 'audio');
+    assert.equal(fns.mediaKind('https://gitee-ai.su.bcebos.com/abc123?sig=1', 'threeD'), 'model');
+});
+
 test('formatBytes: 各量级显示', () => {
     assert.equal(fns.formatBytes(0), '0 B');
     assert.equal(fns.formatBytes(512), '512 B');

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.7
+// @version      2.9.8
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -3354,9 +3354,13 @@
         [previewImg, previewVideo, previewAudio, previewFileCard, previewText].forEach(node => {
             node.style.display = 'none';
         });
+        // 先暂停再清 src：只 removeAttribute 不会可靠停止播放，可能切走后音视频仍在响
+        try { previewVideo.pause(); previewAudio.pause(); } catch (_) {}
         previewImg.removeAttribute('src');
         previewVideo.removeAttribute('src');
+        previewVideo.load();
         previewAudio.removeAttribute('src');
+        previewAudio.load();
         previewText.textContent = '';
     }
 
@@ -4668,7 +4672,9 @@
         if (['mp4', 'webm', 'mov'].includes(ext)) return 'video';
         if (['wav', 'mp3', 'mpeg', 'ogg', 'm4a'].includes(ext)) return 'audio';
         if (mode === 'threeD' || ['glb', 'stl', 'obj'].includes(ext)) return 'model';
+        // 生成模式对产物类型是确定的：签名 URL 不带扩展名时按模式兜底，避免视频被误判成图片
         if (mode === 'speech') return 'audio';
+        if (mode === 'textVideo' || mode === 'imageVideo') return 'video';
         return 'image';
     }
 
@@ -4732,6 +4738,7 @@
         activeTaskUrls = created.data.urls || created.data.task_urls || null;
         cancelBtn.style.display = '';
         const url = await pollTask(taskId, token, opts.prompt || '');
+        let playedViaObjectUrl = '';
         if (isHttpUrl(url)) {
             const kind = opts.kindOverride || mediaKind(url, opts.mode);
             currentResult = {
@@ -4740,11 +4747,22 @@
                 ext: extFromUrl(url, opts.extFor ? opts.extFor(kind, url) : extFallback(kind))
             };
             if (opts.filenameFor) currentResult.filename = opts.filenameFor(url);
+            // 远端直链在第三方页面会被 BOS 防盗链/Referer 拦截，<video>/<audio> 播放会失败（下载走 GM 通道所以正常）；
+            // 统一先取回内容用 objectURL 播放，失败时回退直链
+            if (kind === 'video' || kind === 'audio') {
+                try {
+                    const blob = await requestBlob(url);
+                    playedViaObjectUrl = URL.createObjectURL(blob);
+                    currentResult.url = playedViaObjectUrl;
+                    currentResult.sourceUrl = url;
+                } catch (_) {}
+            }
         } else {
             // 异步文本类任务返回 output.text_result，是纯文本而非 URL
             currentResult = { kind: 'text', text: String(url), ext: 'txt' };
         }
         showResult(currentResult, opts.displayPrompt || '');
+        if (playedViaObjectUrl) currentObjectUrl = playedViaObjectUrl;
         addToHistory(currentResult, opts.historyPrompt, {
             mode: opts.mode,
             model: getModeSelect(opts.mode).value,
