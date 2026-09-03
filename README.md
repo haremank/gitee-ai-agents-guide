@@ -1,7 +1,7 @@
 # Gitee AI 多模型生成工作台
 
 [![GitHub](https://img.shields.io/badge/GitHub-haremank%2Fgitee--ai--agents--guide-blue?style=flat&logo=github)](https://github.com/haremank/gitee-ai-agents-guide)
-[![Version](https://img.shields.io/badge/版本-v2.9.3-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
+[![Version](https://img.shields.io/badge/版本-v2.9.4-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
 [![Usage](https://img.shields.io/badge/用途-仅限个人学习-red)](https://github.com/haremank/gitee-ai-agents-guide#readme)
 
 基于 Tampermonkey 的油猴脚本：在任意网页提供可拖拽的多模型生成面板，自动获取令牌与额度，支持异步任务轮询、结果预览下载与 Agent 提示词一键导出。
@@ -134,3 +134,7 @@ Agent 会按指南选择对应接口：上传 multipart 文件、提交异步任
 | 语音识别 🆓 | GLM-ASR（轻量中文）、SenseVoice Small（中英日韩多语种） | 支持 mp3 / wav / m4a，全部免费 |
 
 文生图面板中，Z-Image Turbo 和 FLUX.1 Schnell 为实测验证过的推荐模型，出图速度快、质量稳定。代码与文档不含明文密钥，令牌仅存于浏览器本地或环境变量。
+
+## 许可证
+
+本项目以 [MIT License](LICENSE) 开源。请配合上方免责声明理解：代码可自由使用与修改，但使用本项目访问 Gitee AI 平台产生的内容、费用与合规责任由使用者自行承担。
