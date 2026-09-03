@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.9
+// @version      2.9.10
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -319,8 +319,9 @@
                 libraryDb = request.result;
                 resolve(libraryDb);
             };
-            request.onerror = () => resolve(null);
-            request.onblocked = () => resolve(null); // 旧标签页持库连接时避免永久挂起
+            // 失败/被阻塞时不永久缓存 null：下次打开面板自动重试
+            request.onerror = () => { libraryReady = null; resolve(null); };
+            request.onblocked = () => { libraryReady = null; resolve(null); };
         });
         return libraryReady;
     }
@@ -2667,15 +2668,25 @@
         })();
         libraryInitPromise.catch(error => {
             console.warn('[Gitee AI Generator] 本地库初始化失败', error);
+            try {
+                const message = error && error.message ? error.message : String(error);
+                historySection.style.display = 'block';
+                libraryCount.textContent = '⚠️ 加载失败';
+                historyStrip.innerHTML = '';
+                const empty = document.createElement('div');
+                empty.className = 'zimg-library-empty';
+                empty.textContent = `本地库加载失败：${message}。另外：本地库按浏览器站点隔离，在哪个网站生成 / 导入，就到那个网站查看。`;
+                historyStrip.appendChild(empty);
+            } catch (_) {}
         });
         return libraryInitPromise;
     }
 
     // 按创建时间倒序读取一页本地库记录；skipCount>0 时用游标 advance 跳过已载入条目续读
     function loadLibraryPage(pageSize, skipCount) {
-        return openLibrary().then(db => new Promise((resolve) => {
+        return openLibrary().then(db => new Promise((resolve, reject) => {
             if (!db) {
-                resolve({ items: [], hasMore: false });
+                reject(new Error('IndexedDB 不可用（隐私模式限制，或旧标签页仍占用旧版本）'));
                 return;
             }
             const items = [];
@@ -2726,10 +2737,14 @@
 
     async function loadMoreLibrary() {
         if (!libraryHasMore) return;
-        const page = await loadLibraryPage(LIBRARY_PAGE_SIZE, libraryList.length);
-        libraryList = libraryList.concat(page.items);
-        libraryHasMore = page.hasMore;
-        renderLibrary();
+        try {
+            const page = await loadLibraryPage(LIBRARY_PAGE_SIZE, libraryList.length);
+            libraryList = libraryList.concat(page.items);
+            libraryHasMore = page.hasMore;
+            renderLibrary();
+        } catch (error) {
+            showStatus('error', `❌ 本地库加载失败：${error.message}`);
+        }
     }
 
     function libraryMatches(item) {
@@ -2751,10 +2766,7 @@
     function renderLibrary() {
         libraryObjectUrls.forEach(url => URL.revokeObjectURL(url));
         libraryObjectUrls = [];
-        if (!libraryList.length) {
-            historySection.style.display = 'none';
-            return;
-        }
+        // 本地库板块常驻默认位置：空库显示占位说明，不再自动隐藏
         historySection.style.display = 'block';
         const items = libraryList.filter(libraryMatches);
         const totalBytes = libraryList.reduce((sum, item) => sum + (item.size || 0), 0);
@@ -2764,6 +2776,13 @@
             ? `本地库已有 ${libraryList.length} 条记录，占用约 ${formatBytes(totalBytes)}；可逐条删除或使用“清空本地库”`
             : '';
         historyStrip.innerHTML = '';
+        if (!libraryList.length) {
+            const empty = document.createElement('div');
+            empty.className = 'zimg-library-empty';
+            empty.textContent = '本地库为空。注意：本地库按浏览器站点隔离——在哪个网站生成 / 导入，就到那个网站查看。';
+            historyStrip.appendChild(empty);
+            return;
+        }
         if (!items.length) {
             const empty = document.createElement('div');
             empty.className = 'zimg-library-empty';
