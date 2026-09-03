@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.10.0
+// @version      2.11.0
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -424,6 +424,8 @@
 
     function mimeForExt(ext) {
         const types = {
+            txt: 'text/plain',
+            json: 'application/json',
             png: 'image/png',
             jpg: 'image/jpeg',
             jpeg: 'image/jpeg',
@@ -1988,7 +1990,7 @@
 
                 <div class="zimg-field" id="zimg-history-section" style="display:none;">
                     <div class="zimg-label-row">
-                        <span class="zimg-label">🗂 本地库 <span class="zimg-label-sub" id="zimg-library-count"></span><span class="zimg-label-sub"> · 共享存储（全站点共用）</span></span>
+                        <span class="zimg-label">🗂 本地库 <span class="zimg-label-sub" id="zimg-library-count"></span><span class="zimg-label-sub" id="zimg-library-location"></span></span>
                         <span class="zimg-label-sub" style="cursor:pointer;" id="zimg-btn-clear-history">清空本地库</span>
                     </div>
                     <div class="zimg-library-controls">
@@ -2115,6 +2117,7 @@
     const historyStrip = document.getElementById('zimg-history-strip');
     const clearHistoryBtn = document.getElementById('zimg-btn-clear-history');
     const libraryCount = document.getElementById('zimg-library-count');
+    const libraryLocationEl = document.getElementById('zimg-library-location');
     const librarySearch = document.getElementById('zimg-library-search');
     const libraryType = document.getElementById('zimg-library-type');
     const chooseSaveDirBtn = document.getElementById('zimg-btn-choose-save-dir');
@@ -2371,14 +2374,6 @@
         return libraryList.find(item => item.id === id) || null;
     }
 
-    // 取完整条目：媒体内容按需从 GM 存储分片重组
-    async function getLibraryItem(id) {
-        const record = getLibraryRecord(id);
-        if (!record || record.kind === 'text') return record;
-        const blob = mediaFromChunks(gmGet(LIB_MEDIA_PREFIX + id, null));
-        return blob ? { ...record, blob } : record;
-    }
-
     // 生成列表用小缩略图：优先 WebP（支持透明），回退 JPEG；失败返回 null，列表回退原图
     async function makeImageThumbnail(blob, maxSize = 320) {
         try {
@@ -2488,6 +2483,49 @@
         }
     }
 
+    // ---- 指定目录索引（library.json）：目录即库，索引与媒体文件放在一起 ----
+    const LIBRARY_JSON_NAME = 'library.json';
+
+    async function writeLibraryJsonToDirectory() {
+        if (!downloadDirectoryHandle) return;
+        try {
+            const fileHandle = await downloadDirectoryHandle.getFileHandle(LIBRARY_JSON_NAME, { create: true });
+            const writable = await fileHandle.createWritable();
+            await writable.write(JSON.stringify(loadLibraryIndex(), null, 2));
+            await writable.close();
+        } catch (error) {
+            console.warn('[Gitee AI Generator] library.json 写入失败', error);
+        }
+    }
+
+    // 打开面板时把目录里的 library.json 并入 GM 索引（按 id 去重，目录为准），再写回合并结果
+    async function mergeLibraryJsonFromDirectory() {
+        if (!downloadDirectoryHandle) return;
+        try {
+            const fileHandle = await downloadDirectoryHandle.getFileHandle(LIBRARY_JSON_NAME);
+            const diskIndex = JSON.parse(await (await fileHandle.getFile()).text());
+            const index = loadLibraryIndex();
+            const known = new Set(index.map(item => item.id));
+            let added = 0;
+            for (const entry of Array.isArray(diskIndex) ? diskIndex : []) {
+                if (!entry || !entry.id || known.has(entry.id)) continue;
+                index.unshift(entry);
+                added += 1;
+            }
+            if (added) {
+                saveLibraryIndex(index);
+                console.log(`[Gitee AI Generator] 已从指定目录并入 ${added} 条记录`);
+            }
+            await writeLibraryJsonToDirectory();
+        } catch (error) {
+            if (error && error.name === 'NotFoundError') {
+                await writeLibraryJsonToDirectory();
+                return;
+            }
+            console.warn('[Gitee AI Generator] library.json 读取失败', error);
+        }
+    }
+
     async function saveLibraryItem(result, prompt, meta = {}) {
         const now = Date.now();
         const kind = result.kind || 'image';
@@ -2518,6 +2556,10 @@
 
         const probed = await probeMedia(blob, kind);
         const thumb = kind === 'image' ? await makeImageThumbnail(blob) : null;
+        // 文本内容在设置了目录时也落为真实文件
+        if (kind === 'text' && !blob) {
+            blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+        }
         const record = {
             id: `${now.toString(36)}-${hashString(`${result.url || text}|${prompt}|${Math.random()}`)}`,
             kind,
@@ -2531,7 +2573,7 @@
             filename: result.filename || `gitee-ai-${kind}-${now}.${ext}`,
             createdAt: now,
             text,
-            size: blob ? blob.size : (kind === 'text' ? text.length : 0),
+            size: blob ? blob.size : 0,
             mime,
             width: probed.width,
             height: probed.height,
@@ -2542,21 +2584,32 @@
         const index = loadLibraryIndex();
         index.unshift(record);
         saveLibraryIndex(index);
-        if (blob) {
-            // 分片 base64 写入 GM 存储（ yieldToUi 已在分片间隙让出主线程）
-            gmSet(LIB_MEDIA_PREFIX + record.id, { mime, chunks: await blobToBase64Chunks(blob) });
-        }
         if (thumb) {
             gmSet(LIB_THUMB_PREFIX + record.id, await blobToDataURL(thumb));
         }
-        if (downloadDirectoryHandle) {
+        // 指定目录为主存储：优先写为真实文件，之后默认从该文件读取；写入失败才回退脚本存储分片
+        if (blob && kind !== 'text') {
+            let writtenToDisk = false;
+            if (downloadDirectoryHandle) {
+                try {
+                    await saveRecordToDirectory({ ...record, blob });
+                    writtenToDisk = Boolean(record.savedFilename);
+                } catch (error) {
+                    console.warn('[Gitee AI Generator] 写入指定目录失败，改存脚本存储', error);
+                    renderSaveDirectoryState(`保存失败：${error.message}`);
+                }
+            }
+            if (!writtenToDisk) {
+                gmSet(LIB_MEDIA_PREFIX + record.id, { mime, chunks: await blobToBase64Chunks(blob) });
+            }
+        } else if (blob && kind === 'text' && downloadDirectoryHandle) {
             try {
                 await saveRecordToDirectory({ ...record, blob });
             } catch (error) {
-                console.warn('[Gitee AI Generator] 自动保存到目录失败', error);
-                renderSaveDirectoryState(`保存失败：${error.message}`);
+                console.warn('[Gitee AI Generator] 文本写入指定目录失败（仅保留索引）', error);
             }
         }
+        await writeLibraryJsonToDirectory();
         renderLibrary();
         return record.id;
     }
@@ -2834,6 +2887,7 @@
         libraryInitPromise = (async () => {
             await migrateLegacyHistory();
             await migrateIdbLibrary();
+            await mergeLibraryJsonFromDirectory();
             refreshLibrary();
         })();
         libraryInitPromise.catch(error => {
@@ -2883,12 +2937,15 @@
         libraryObjectUrls = [];
         // 本地库板块常驻默认位置：空库显示占位说明，不再自动隐藏
         historySection.style.display = 'block';
+        libraryLocationEl.textContent = downloadDirectoryHandle
+            ? ` · 指定目录：${downloadDirectoryHandle.name}`
+            : ' · 脚本共享存储（设置目录后保存为文件）';
         const filtered = libraryList.filter(libraryMatches);
         const items = filtered.slice(0, libraryRendered);
         const totalBytes = libraryList.reduce((sum, item) => sum + (item.size || 0), 0);
         libraryCount.textContent = `${filtered.length} / ${libraryList.length} · ${formatBytes(totalBytes)}` +
             (libraryList.length > LIBRARY_SOFT_LIMIT ? ' · 建议清理' : '');
-        libraryCount.title = `存储位置：油猴脚本共享存储（Tampermonkey 管理，全站点共用同一份库，不随浏览站点变化）`
+        libraryCount.title = `存储位置：${downloadDirectoryHandle ? '指定目录 ' + downloadDirectoryHandle.name + '（全站点共用同一份库，目录索引见 library.json）' : '油猴脚本共享存储（Tampermonkey 管理，全站点共用；设置目录后媒体保存为文件）'}`
             + (libraryList.length > LIBRARY_SOFT_LIMIT
                 ? `；本地库已有 ${libraryList.length} 条记录，占用约 ${formatBytes(totalBytes)}，可逐条删除或使用“清空本地库”`
                 : '');
@@ -2970,7 +3027,7 @@
 
     async function openLibraryItem(id) {
         try {
-            const item = await getLibraryItem(id);
+            const item = getLibraryRecord(id);
             if (!item) {
                 refreshLibrary();
                 return;
@@ -2979,22 +3036,32 @@
             let result;
             if (item.kind === 'text') {
                 result = { kind: 'text', text: item.text || '', ext: item.ext || 'txt' };
-            } else if (item.blob) {
-                releaseCurrentObjectUrl();
-                objectUrl = URL.createObjectURL(item.blob);
-                result = { url: objectUrl, kind: item.kind, ext: item.ext, filename: item.filename };
-            } else if ((item.kind === 'video' || item.kind === 'audio') && isHttpUrl(item.sourceUrl)) {
-                // 无本地副本的记录：直链在第三方页面会被防盗链拦截，先取回再播，失败回退直链
-                try {
-                    const blob = await requestBlob(item.sourceUrl, item.ext);
+            } else {
+                // 默认读取顺序：指定目录中的文件 → 脚本存储分片 → 远端直链取回
+                let blob = null;
+                if (item.savedFilename && downloadDirectoryHandle) {
+                    try {
+                        const fileHandle = await downloadDirectoryHandle.getFileHandle(item.savedFilename);
+                        blob = await fileHandle.getFile();
+                    } catch (_) {}
+                }
+                if (!blob) blob = mediaFromChunks(gmGet(LIB_MEDIA_PREFIX + id, null));
+                if (!blob && (item.kind === 'video' || item.kind === 'audio') && isHttpUrl(item.sourceUrl)) {
+                    try {
+                        blob = await requestBlob(item.sourceUrl, item.ext);
+                    } catch (_) {}
+                }
+                if (blob) {
+                    const type = String(blob.type || '');
+                    if ((!type || type === 'application/octet-stream') && item.mime) {
+                        try { blob = blob.slice(0, blob.size, item.mime); } catch (_) {}
+                    }
                     releaseCurrentObjectUrl();
                     objectUrl = URL.createObjectURL(blob);
                     result = { url: objectUrl, kind: item.kind, ext: item.ext, filename: item.filename };
-                } catch (_) {
+                } else {
                     result = { url: item.sourceUrl, kind: item.kind, ext: item.ext, filename: item.filename };
                 }
-            } else {
-                result = { url: item.sourceUrl, kind: item.kind, ext: item.ext, filename: item.filename };
             }
             result.sourceUrl = item.sourceUrl || '';
             showResult(result, item.prompt);
@@ -3020,6 +3087,7 @@
             gmDel(LIB_MEDIA_PREFIX + id);
             gmDel(LIB_THUMB_PREFIX + id);
             saveLibraryIndex(loadLibraryIndex().filter(item => item.id !== id));
+            await writeLibraryJsonToDirectory();
             refreshLibrary();
             showStatus('success', '🗑 已删除这条本地记录');
             hideStatusLater(1500);
@@ -3057,6 +3125,7 @@
                 safeGM.setValue(STORAGE_HISTORY_KEY, '[]');
                 localStorage.removeItem(STORAGE_HISTORY_KEY);
             } catch (_) {}
+            await writeLibraryJsonToDirectory();
             refreshLibrary();
             showStatus('success', '🧹 本地库已清空');
             hideStatusLater(1500);
