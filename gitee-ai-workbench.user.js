@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.5
+// @version      2.9.6
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -125,7 +125,7 @@
     const STORAGE_HISTORY_KEY = 'gitee_ai_zimage_history';
     const STORAGE_DISMISSED_CLOUD_TASKS_KEY = 'gitee_ai_dismissed_cloud_tasks';
     const LIBRARY_DB_NAME = 'gitee-ai-workbench-library';
-    const LIBRARY_DB_VERSION = 1;
+    const LIBRARY_DB_VERSION = 2;
     const LIBRARY_STORE = 'items';
     const SETTINGS_DB_NAME = 'gitee-ai-workbench-settings';
     const SETTINGS_DB_VERSION = 1;
@@ -245,6 +245,7 @@
     let isGenerating = false;
     let generateTimer = null;
     let generateStartTime = 0;
+    // 旧版 12 条 URL 历史：仅作为一次性迁移数据源，渲染一律走 IndexedDB 的 libraryList
     let historyList = [];
     let libraryDb = null;
     let libraryReady = null;
@@ -255,6 +256,9 @@
     let libraryObjectUrls = [];
     // 本地库软上限：超过后在计数旁提示清理建议，不自动删除任何内容
     const LIBRARY_SOFT_LIMIT = 300;
+    // 列表分页大小：只把最近一页记录（含 blob）载入内存，更早的靠“加载更早的内容”续读
+    const LIBRARY_PAGE_SIZE = 60;
+    let libraryHasMore = false;
     let settingsDbReady = null;
     let downloadDirectoryHandle = null;
     let downloadDirectoryNeedsPermission = false;
@@ -285,10 +289,11 @@
             const request = indexedDB.open(LIBRARY_DB_NAME, LIBRARY_DB_VERSION);
             request.onupgradeneeded = () => {
                 const db = request.result;
-                if (!db.objectStoreNames.contains(LIBRARY_STORE)) {
-                    const store = db.createObjectStore(LIBRARY_STORE, { keyPath: 'id' });
-                    store.createIndex('createdAt', 'createdAt');
-                }
+                const store = db.objectStoreNames.contains(LIBRARY_STORE)
+                    ? request.transaction.objectStore(LIBRARY_STORE)
+                    : db.createObjectStore(LIBRARY_STORE, { keyPath: 'id' });
+                if (!store.indexNames.contains('createdAt')) store.createIndex('createdAt', 'createdAt');
+                if (!store.indexNames.contains('taskId')) store.createIndex('taskId', 'taskId');
             };
             request.onsuccess = () => {
                 libraryDb = request.result;
@@ -313,6 +318,18 @@
             tx.onerror = () => reject(tx.error || new Error('本地库读写失败'));
             tx.onabort = () => reject(tx.error || new Error('本地库操作被中断'));
         }));
+    }
+
+    // 云端任务导入去重：走 taskId 索引做点查，避免为去重把整库读进内存
+    async function hasLibraryTaskId(taskId) {
+        const key = String(taskId || '');
+        if (!key) return false;
+        try {
+            const row = await withLibrary('readonly', store => store.index('taskId').get(key));
+            return Boolean(row);
+        } catch (_) {
+            return libraryList.some(item => item.taskId === taskId);
+        }
     }
 
     function openSettingsDb() {
@@ -1259,6 +1276,21 @@
             color: #64748b !important;
             font-size: 12px;
         }
+
+        .zimg-library-more {
+            grid-column: 1 / -1;
+            padding: 8px;
+            border: 1px dashed #cbd5e1;
+            border-radius: 8px;
+            background: #f8fafc;
+            color: #475569 !important;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .zimg-library-more:hover {
+            background: #eef2f7;
+        }
         .zimg-cloud-summary {
             display: flex;
             flex-wrap: wrap;
@@ -1702,8 +1734,6 @@
                                 <option value="1024x1024" selected>1024 × 1024（默认高清）</option>
                                 <option value="1024x768">1024 × 768（4:3）</option>
                                 <option value="768x1024">768 × 1024（3:4）</option>
-                                <option value="1536x864">1536 × 864（16:9）</option>
-                                <option value="2048x2048">2048 × 2048（超清）</option>
                             </select>
                         </div>
                         <div class="zimg-field">
@@ -2328,6 +2358,28 @@
         return withLibrary('readonly', store => store.get(id));
     }
 
+    // 生成列表用小缩略图：优先 WebP（支持透明），回退 JPEG；失败返回 null，列表回退原图
+    async function makeImageThumbnail(blob, maxSize = 320) {
+        try {
+            if (typeof createImageBitmap !== 'function' || !blob || !String(blob.type || '').startsWith('image/')) return null;
+            const bitmap = await createImageBitmap(blob);
+            const scale = Math.min(1, maxSize / Math.max(bitmap.width || 1, bitmap.height || 1));
+            const width = Math.max(1, Math.round((bitmap.width || 1) * scale));
+            const height = Math.max(1, Math.round((bitmap.height || 1) * scale));
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            canvas.getContext('2d').drawImage(bitmap, 0, 0, width, height);
+            bitmap.close();
+            const encode = (type) => new Promise((resolve) => canvas.toBlob(resolve, type, 0.72));
+            let thumb = await encode('image/webp');
+            if (!thumb || thumb.type !== 'image/webp') thumb = await encode('image/jpeg');
+            return thumb && thumb.size > 0 && thumb.size < blob.size ? thumb : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
     async function saveLibraryItem(result, prompt, meta = {}) {
         const now = Date.now();
         const kind = result.kind || 'image';
@@ -2357,6 +2409,7 @@
         }
 
         const probed = await probeMedia(blob, kind);
+        const thumb = kind === 'image' ? await makeImageThumbnail(blob) : null;
         const record = {
             id: `${now.toString(36)}-${hashString(`${result.url || text}|${prompt}|${Math.random()}`)}`,
             kind,
@@ -2369,6 +2422,7 @@
             filename: result.filename || `gitee-ai-${kind}-${now}.${ext}`,
             createdAt: now,
             blob,
+            thumb,
             text,
             size: blob ? blob.size : 0,
             mime,
@@ -2509,7 +2563,7 @@
             await storeDownloadDirectory(handle);
             renderSaveDirectoryState();
             showStatus('success', '✅ 新生成内容将自动保存到此目录');
-            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2000);
+            hideStatusLater(2000);
         } catch (error) {
             if (error && error.name === 'AbortError') return;
             console.error('[Gitee AI Generator] 选择保存目录失败', error);
@@ -2524,7 +2578,7 @@
             downloadDirectoryNeedsPermission = false;
             renderSaveDirectoryState();
             showStatus('success', '✅ 已清除自动保存目录');
-            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 1500);
+            hideStatusLater(1500);
         } catch (error) {
             console.error('[Gitee AI Generator] 清除保存目录失败', error);
             showStatus('error', `❌ 清除保存目录失败：${error.message}`);
@@ -2593,9 +2647,64 @@
         return libraryInitPromise;
     }
 
+    // 按创建时间倒序读取一页本地库记录；skipCount>0 时用游标 advance 跳过已载入条目续读
+    function loadLibraryPage(pageSize, skipCount) {
+        return openLibrary().then(db => new Promise((resolve) => {
+            if (!db) {
+                resolve({ items: [], hasMore: false });
+                return;
+            }
+            const items = [];
+            let hasMore = false;
+            let settled = false;
+            let remainingSkip = skipCount;
+            const finish = (result) => {
+                if (settled) return;
+                settled = true;
+                resolve(result);
+            };
+            try {
+                const tx = db.transaction(LIBRARY_STORE, 'readonly');
+                const request = tx.objectStore(LIBRARY_STORE).index('createdAt').openCursor(null, 'prev');
+                request.onsuccess = (event) => {
+                    const cursor = event.target.result;
+                    if (!cursor) {
+                        finish({ items, hasMore });
+                        return;
+                    }
+                    if (remainingSkip > 0) {
+                        const step = remainingSkip;
+                        remainingSkip = 0;
+                        cursor.advance(step);
+                        return;
+                    }
+                    if (items.length >= pageSize) {
+                        hasMore = true;
+                        finish({ items, hasMore });
+                        return;
+                    }
+                    items.push(cursor.value);
+                    cursor.continue();
+                };
+                request.onerror = () => finish({ items, hasMore });
+            } catch (_) {
+                finish({ items, hasMore });
+            }
+        }));
+    }
+
     async function refreshLibrary() {
-        const items = await withLibrary('readonly', store => store.getAll());
-        libraryList = (items || []).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        const page = await loadLibraryPage(LIBRARY_PAGE_SIZE, 0);
+        libraryList = page.items;
+        libraryHasMore = page.hasMore;
+        renderLibrary();
+    }
+
+    async function loadMoreLibrary() {
+        if (!libraryHasMore) return;
+        const page = await loadLibraryPage(LIBRARY_PAGE_SIZE, libraryList.length);
+        libraryList = libraryList.concat(page.items);
+        libraryHasMore = page.hasMore;
         renderLibrary();
     }
 
@@ -2655,8 +2764,9 @@
             if (item.kind === 'image') {
                 const thumb = document.createElement('img');
                 thumb.alt = item.prompt || '本地生成图片';
-                if (item.blob) {
-                    const objectUrl = URL.createObjectURL(item.blob);
+                const thumbBlob = item.thumb || item.blob;
+                if (thumbBlob) {
+                    const objectUrl = URL.createObjectURL(thumbBlob);
                     libraryObjectUrls.push(objectUrl);
                     thumb.src = objectUrl;
                 } else {
@@ -2687,6 +2797,14 @@
             card.append(badge, deleteBtn);
             historyStrip.appendChild(card);
         });
+        if (libraryHasMore) {
+            const moreBtn = document.createElement('button');
+            moreBtn.type = 'button';
+            moreBtn.className = 'zimg-library-more';
+            moreBtn.textContent = `加载更早的内容（已显示 ${libraryList.length} 条）…`;
+            moreBtn.addEventListener('click', loadMoreLibrary);
+            historyStrip.appendChild(moreBtn);
+        }
     }
 
     async function openLibraryItem(id) {
@@ -2731,7 +2849,7 @@
             await withLibrary('readwrite', store => store.delete(id));
             await refreshLibrary();
             showStatus('success', '🗑 已删除这条本地记录');
-            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 1500);
+            hideStatusLater(1500);
         } catch (error) {
             console.error('[Gitee AI Generator] 删除本地库内容失败', error);
             showStatus('error', `❌ 删除失败：${error.message}`);
@@ -2762,7 +2880,7 @@
             localStorage.removeItem(STORAGE_HISTORY_KEY);
             await refreshLibrary();
             showStatus('success', '🧹 本地库已清空');
-            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 1500);
+            hideStatusLater(1500);
         } catch (error) {
             console.error('[Gitee AI Generator] 清空本地库失败', error);
             showStatus('error', `❌ 本地库清空失败：${error.message}`);
@@ -2836,7 +2954,7 @@
             headers: { Authorization: `Bearer ${token}` }
         });
         if (first.status < 200 || first.status >= 300) {
-            throw new Error(requestErrorMessage(first.status, first.data));
+            throw new Error(requestErr(first.status, first.data));
         }
         let items = Array.isArray(first.data.items) ? first.data.items : [];
         const total = Number(first.data.total);
@@ -2865,11 +2983,16 @@
         cloudTaskTotal = cloudTasks.length;
     }
 
-    function renderCloudTasks(error = '') {
+    async function renderCloudTasks(error = '') {
         const counts = cloudTasks.reduce((acc, task) => {
             acc[task.status] = (acc[task.status] || 0) + 1;
             return acc;
         }, {});
+        // 去重走 taskId 索引点查：分页后内存列表只是最近窗口，不能作为“已在库”依据
+        const importedIds = new Set();
+        for (const task of cloudTasks) {
+            if (task.status === 'success' && await hasLibraryTaskId(task.task_id)) importedIds.add(task.task_id);
+        }
         const statusLabels = { waiting: '等待', in_progress: '进行中', success: '成功', failure: '失败', cancelled: '已取消' };
         const pills = [
             `共 ${cloudTaskTotal} 条`,
@@ -2886,7 +3009,7 @@
         });
         cloudTaskStrip.innerHTML = '';
         const importable = cloudTasks.filter(task => task.status === 'success' &&
-            cloudTaskOutputUrl(task) && !libraryList.some(item => item.taskId === task.task_id) &&
+            cloudTaskOutputUrl(task) && !importedIds.has(task.task_id) &&
             !cloudTaskLinkExpired(task)).length;
         importSuccessBtn.disabled = importingCloudTasks || importable === 0;
         if (error) {
@@ -2919,7 +3042,7 @@
             time.textContent = formatCloudTime(cloudTaskTimestamp(task));
             card.append(id, status, time);
             if (task.status === 'success' && cloudTaskOutputUrl(task)) {
-                const imported = libraryList.some(item => item.taskId === task.task_id);
+                const imported = importedIds.has(task.task_id);
                 const expired = imported ? false : cloudTaskLinkExpired(task);
                 const actions = document.createElement('div');
                 actions.className = 'zimg-cloud-actions';
@@ -2948,9 +3071,11 @@
                         event.stopPropagation();
                         importButton.disabled = true;
                         importButton.textContent = '⏳ 导入中';
+                        let importedNow = false;
                         try {
                             await importCloudTask(task);
-                            importButton.textContent = libraryList.some(item => item.taskId === task.task_id) ? '✅ 已导入' : '⚠️ 远程保留';
+                            importedNow = await hasLibraryTaskId(task.task_id);
+                            importButton.textContent = importedNow ? '✅ 已导入' : '⚠️ 远程保留';
                         } catch (err) {
                             console.warn('[Gitee AI Generator] 云端任务导入失败', err);
                             if (/404|expired|过期/i.test(err.message)) {
@@ -2962,7 +3087,7 @@
                                 showStatus('error', `❌ 任务导入失败：${err.message}`);
                             }
                         } finally {
-                            importButton.disabled = importingCloudTasks || libraryList.some(item => item.taskId === task.task_id);
+                            importButton.disabled = importingCloudTasks || importedNow;
                         }
                     });
                 }
@@ -3091,18 +3216,21 @@
 
     async function importAllSuccessfulTasks() {
         if (importingCloudTasks) return;
-        const tasks = cloudTasks.filter(task => task.status === 'success' &&
-            cloudTaskOutputUrl(task) && !libraryList.some(item => item.taskId === task.task_id) &&
-            !cloudTaskLinkExpired(task));
-        const skippedExpired = cloudTasks.filter(task => task.status === 'success' &&
-            cloudTaskOutputUrl(task) && !libraryList.some(item => item.taskId === task.task_id) &&
-            cloudTaskLinkExpired(task)).length;
-        if (!tasks.length) return;
+        // 去重与过期判定逐条点查（taskId 索引），不再依赖分页后的内存列表
+        const targets = [];
+        let skippedExpired = 0;
+        for (const task of cloudTasks) {
+            if (task.status !== 'success' || !cloudTaskOutputUrl(task)) continue;
+            if (await hasLibraryTaskId(task.task_id)) continue;
+            if (cloudTaskLinkExpired(task)) skippedExpired += 1;
+            else targets.push(task);
+        }
+        if (!targets.length) return;
         importingCloudTasks = true;
         importSuccessBtn.disabled = true;
         let completed = 0;
-        for (const [index, task] of tasks.entries()) {
-            importSuccessBtn.textContent = `⏳ 导入中 ${index + 1}/${tasks.length}`;
+        for (const [index, task] of targets.entries()) {
+            importSuccessBtn.textContent = `⏳ 导入中 ${index + 1}/${targets.length}`;
             try {
                 await importCloudTask(task);
                 completed += 1;
@@ -3113,11 +3241,11 @@
         importingCloudTasks = false;
         importSuccessBtn.textContent = '📥 导入全部成功';
         renderCloudTasks();
-        showStatus(completed === tasks.length ? 'success' : 'loading',
-            completed === tasks.length
+        showStatus(completed === targets.length ? 'success' : 'loading',
+            completed === targets.length
                 ? `✅ 已导入 ${completed} 个云端产物`
-                : `⚠️ 已导入 ${completed}/${tasks.length} 个${skippedExpired ? `；${skippedExpired} 个链接已过期` : ''}`);
-        setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2500);
+                : `⚠️ 已导入 ${completed}/${targets.length} 个${skippedExpired ? `；${skippedExpired} 个链接已过期` : ''}`);
+        hideStatusLater(2500);
     }
 
     refreshTasksBtn.addEventListener('click', () => loadCloudTasks());
@@ -3145,7 +3273,7 @@
         if (textResult) {
             showResult({ kind: 'text', text: String(textResult), ext: 'txt' }, '(云端异步任务预览)');
             showStatus('loading', '👁 正在预览云端任务结果（未保存到本地库）');
-            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2000);
+            hideStatusLater(2000);
             return;
         }
         const url = cloudTaskOutputUrl(task);
@@ -3169,7 +3297,7 @@
             showResult(result, '(云端异步任务预览)');
             currentObjectUrl = objectUrl;
             showStatus('loading', '👁 正在预览云端任务结果（未保存到本地库）');
-            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2000);
+            hideStatusLater(2000);
         } catch (error) {
             if (/404|expired|过期/i.test(error.message)) {
                 cloudTaskExpired.add(task.task_id);
@@ -3191,7 +3319,7 @@
             headers: { Authorization: `Bearer ${token}` }
         });
         if (response.status < 200 || response.status >= 300) {
-            throw new Error(requestErrorMessage(response.status, response.data));
+            throw new Error(requestErr(response.status, response.data));
         }
         cloudTaskDismissed.add(task.task_id);
         persistDismissedCloudTasks();
@@ -3285,6 +3413,16 @@
         tokenInput.type = tokenInput.type === 'password' ? 'text' : 'password';
     });
 
+    // 统一的“N 秒后自动隐藏状态栏”：生成进行中不打扰，空闲后静默收起
+    function hideStatusLater(delay) {
+        setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, delay);
+    }
+
+    // requestErrorMessage 的常用封装：data 为 JSON 解析结果，raw 自动取其中的原文
+    function requestErr(status, data) {
+        return requestErrorMessage(status, data, data && data.raw);
+    }
+
     function showStatus(type, msg) {
         statusBox.className = `zimg-status ${type}`;
         // msg 可能携带服务端返回的错误原文（可能回显用户 prompt），一律按纯文本渲染，禁止 innerHTML
@@ -3307,7 +3445,7 @@
             updateQuotaDisplay(quota);
             if (force) {
                 showStatus('success', '✅ 已自动获取访问令牌');
-                setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2500);
+                hideStatusLater(2500);
             }
         } else {
             updateQuotaDisplay(quota);
@@ -3534,7 +3672,7 @@
     document.getElementById('zimg-agent-copy').addEventListener('click', () => {
         navigator.clipboard.writeText(agentTextEl.value).then(() => {
             showStatus('success', '✅ Agent 提示词已复制到剪贴板');
-            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2000);
+            hideStatusLater(2000);
         }).catch(err => {
             showStatus('error', '❌ 复制失败：' + err);
         });
@@ -3603,7 +3741,7 @@
                 url: `${API_BASE}/v1/task/${encodeURIComponent(taskId)}${action === 'status' ? '/status' : action === 'cancel' ? '/cancel' : ''}`,
                 headers: { Authorization: `Bearer ${validateToken()}` }
             });
-            if (response.status < 200 || response.status >= 300) throw new Error(requestErrorMessage(response.status, response.data, response.data && response.data.raw));
+            if (response.status < 200 || response.status >= 300) throw new Error(requestErr(response.status, response.data));
             document.getElementById('zimg-console-response').value = JSON.stringify(response.data, null, 2);
             state.textContent = `任务 ${action} 成功`;
         } catch (error) {
@@ -3990,7 +4128,7 @@
 
     async function refreshOpenApiConsole() {
         const response = await requestJson({ method: 'GET', url: API_BASE + '/v1/json', headers: { Authorization: `Bearer ${cleanToken(tokenInput.value)}` } });
-        if (response.status < 200 || response.status >= 300) throw new Error(requestErrorMessage(response.status, response.data, response.data && response.data.raw));
+        if (response.status < 200 || response.status >= 300) throw new Error(requestErr(response.status, response.data));
         openapiSchema = response.data;
         const generated = [];
         const dictionaryLookup = new Map(controlsSchema.d.map((text, index) => [text, index]));
@@ -4102,7 +4240,7 @@
             }
             state.textContent = '请求中…';
             const created = await requestJson({ method: request.method, url: request.url, headers: request.headers, data: request.body });
-            if (created.status < 200 || created.status >= 300) throw new Error(requestErrorMessage(created.status, created.data, created.data && created.data.raw));
+            if (created.status < 200 || created.status >= 300) throw new Error(requestErr(created.status, created.data));
             const taskId = created.data.task_id || (created.data.data && created.data.data.task_id);
             const consoleMeta = {
                 mode: 'console',
@@ -4323,7 +4461,7 @@
         updateChatStateLabel();
         resultBox.style.display = 'none';
         showStatus('success', '🧹 已开始新对话');
-        setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 1500);
+        hideStatusLater(1500);
     });
 
     function buildChatPayload(userMsg) {
@@ -4500,6 +4638,11 @@
         return form;
     }
 
+    // 各类型下载文件缺省扩展名（接口 URL 常无扩展名，落地时兜底）
+    function extFallback(kind) {
+        return { video: 'mp4', audio: 'mpeg', model: 'glb' }[kind] || 'bin';
+    }
+
     function isHttpUrl(value) {
         return /^(https?:|data:)/i.test(String(value || ''));
     }
@@ -4538,7 +4681,7 @@
             if (response.status < 200 || response.status >= 300) {
                 // 429/5xx 视为瞬时故障继续轮询（间隔约 4 秒，天然退避）；其余状态码立即报错
                 if ((response.status === 429 || response.status >= 500) && ++transientErrors <= 5) continue;
-                throw new Error(requestErrorMessage(response.status, task, response.data && response.data.raw));
+                throw new Error(requestErr(response.status, task));
             }
             if (task.status === 'success') {
                 const url = task.output && (task.output.file_url || task.output.url || task.output.text_result);
@@ -4552,38 +4695,46 @@
         throw new Error('等待任务超时，可稍后在 Gitee AI 任务页查看结果');
     }
 
-    async function runJsonGeneration(endpoint, payload, prompt, token) {
+    // 统一异步生成流程：提交 → 轮询 → 结果分发（URL / 纯文本）→ 展示 → 历史入库 → 按需扣减额度。
+    // body 传 JSON 对象或 FormData；opts: { mode, prompt, displayPrompt, historyPrompt, kindOverride, extFor, filenameFor, consumeQuota }
+    async function runAsyncGeneration(token, endpoint, body, opts) {
+        const isForm = body instanceof FormData;
+        const headers = { Authorization: `Bearer ${token}`, 'X-Failover-Enabled': 'true' };
+        if (!isForm) headers['Content-Type'] = 'application/json';
         const created = await requestJson({
             method: 'POST',
             url: API_BASE + endpoint,
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'X-Failover-Enabled': 'true'
-            },
-            data: JSON.stringify(payload)
+            headers,
+            data: isForm ? body : JSON.stringify(body)
         });
         if (created.status < 200 || created.status >= 300) {
-            throw new Error(requestErrorMessage(created.status, created.data, created.data && created.data.raw));
+            throw new Error(requestErr(created.status, created.data));
         }
         const taskId = created.data.task_id;
         if (!taskId) throw new Error('接口未返回 task_id');
         activeTaskId = taskId;
         activeTaskUrls = created.data.urls || created.data.task_urls || null;
         cancelBtn.style.display = '';
-        const url = await pollTask(taskId, token, prompt);
+        const url = await pollTask(taskId, token, opts.prompt || '');
         if (isHttpUrl(url)) {
-            const kind = mediaKind(url, currentMode);
-            showResult({ url, kind, ext: extFromUrl(url, { video: 'mp4', audio: 'mpeg', model: 'glb' }[kind] || 'bin') }, prompt);
+            const kind = opts.kindOverride || mediaKind(url, opts.mode);
+            currentResult = {
+                url,
+                kind,
+                ext: extFromUrl(url, opts.extFor ? opts.extFor(kind, url) : extFallback(kind))
+            };
+            if (opts.filenameFor) currentResult.filename = opts.filenameFor(url);
         } else {
             // 异步文本类任务返回 output.text_result，是纯文本而非 URL
-            showResult({ kind: 'text', text: String(url), ext: 'txt' }, prompt);
+            currentResult = { kind: 'text', text: String(url), ext: 'txt' };
         }
-        addToHistory(currentResult, prompt, {
-            mode: currentMode,
-            model: getModeSelect(currentMode).value,
+        showResult(currentResult, opts.displayPrompt || '');
+        addToHistory(currentResult, opts.historyPrompt, {
+            mode: opts.mode,
+            model: getModeSelect(opts.mode).value,
             taskId
         });
+        if (opts.consumeQuota) updateQuotaDisplay(consumeOneQuota());
     }
 
     async function doGenerate() {
@@ -4611,7 +4762,7 @@
                     data: JSON.stringify(payload)
                 });
                 if (response.status < 200 || response.status >= 300) {
-                    throw new Error(requestErrorMessage(response.status, response.data, response.data && response.data.raw));
+                    throw new Error(requestErr(response.status, response.data));
                 }
                 const item = response.data.data && response.data.data[0];
                 if (!item) throw new Error('接口未返回图片数据');
@@ -4628,66 +4779,46 @@
                 });
             } else if (currentMode === 'textVideo') {
                 const prompt = requirePrompt();
-                await runJsonGeneration(ENDPOINTS.textVideo, buildTextVideoPayload(prompt), prompt, token);
-                updateQuotaDisplay(consumeOneQuota());
+                await runAsyncGeneration(token, ENDPOINTS.textVideo, buildTextVideoPayload(prompt), {
+                    mode: 'textVideo',
+                    prompt,
+                    displayPrompt: prompt,
+                    historyPrompt: prompt,
+                    consumeQuota: true
+                });
             } else if (currentMode === 'speech') {
                 const text = requirePrompt();
-                await runJsonGeneration(ENDPOINTS.speech, buildSpeechPayload(text), text, token);
+                await runAsyncGeneration(token, ENDPOINTS.speech, buildSpeechPayload(text), {
+                    mode: 'speech',
+                    prompt: text,
+                    displayPrompt: text,
+                    historyPrompt: text,
+                    consumeQuota: false // 语音合成为免费模型，不占用每日额度
+                });
             } else if (currentMode === 'imageVideo') {
                 const prompt = requirePrompt();
                 const file = requireFile('zimg-i2v-file');
-                const created = await requestJson({
-                    method: 'POST',
-                    url: API_BASE + ENDPOINTS.imageVideo,
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                        'X-Failover-Enabled': 'true'
-                    },
-                    data: buildImageVideoForm(prompt, file)
-                });
-                if (created.status < 200 || created.status >= 300) throw new Error(requestErrorMessage(created.status, created.data, created.data && created.data.raw));
-                if (!created.data.task_id) throw new Error('接口未返回 task_id');
-                activeTaskId = created.data.task_id;
-                activeTaskUrls = created.data.urls || created.data.task_urls || null;
-                cancelBtn.style.display = '';
-                const url = await pollTask(activeTaskId, token, prompt);
-                currentResult = isHttpUrl(url)
-                    ? { url, kind: 'video', ext: extFromUrl(url, 'mp4') }
-                    : { kind: 'text', text: String(url), ext: 'txt' };
-                showResult(currentResult, prompt);
-                addToHistory(currentResult, prompt, {
+                await runAsyncGeneration(token, ENDPOINTS.imageVideo, buildImageVideoForm(prompt, file), {
                     mode: 'imageVideo',
-                    model: getModeSelect('imageVideo').value,
-                    taskId: activeTaskId
+                    prompt,
+                    displayPrompt: prompt,
+                    historyPrompt: prompt,
+                    kindOverride: 'video', // 签名 URL 常无扩展名，媒体类型由模式决定
+                    extFor: () => 'mp4',
+                    consumeQuota: true
                 });
-                updateQuotaDisplay(consumeOneQuota());
             } else if (currentMode === 'threeD') {
                 const file = requireFile('zimg-3d-file');
-                const created = await requestJson({
-                    method: 'POST',
-                    url: API_BASE + ENDPOINTS.threeD,
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                        'X-Failover-Enabled': 'true'
-                    },
-                    data: buildThreeDForm(file)
-                });
-                if (created.status < 200 || created.status >= 300) throw new Error(requestErrorMessage(created.status, created.data, created.data && created.data.raw));
-                if (!created.data.task_id) throw new Error('接口未返回 task_id');
-                activeTaskId = created.data.task_id;
-                activeTaskUrls = created.data.urls || created.data.task_urls || null;
-                cancelBtn.style.display = '';
-                const url = await pollTask(activeTaskId, token, '');
-                currentResult = isHttpUrl(url)
-                    ? { url, kind: 'model', ext: extFromUrl(url, 'glb'), filename: `model-${Date.now()}.${extFromUrl(url, 'glb')}` }
-                    : { kind: 'text', text: String(url), ext: 'txt' };
-                showResult(currentResult, '');
-                addToHistory(currentResult, `${getModeSelect('threeD').value} 3D 模型`, {
+                await runAsyncGeneration(token, ENDPOINTS.threeD, buildThreeDForm(file), {
                     mode: 'threeD',
-                    model: getModeSelect('threeD').value,
-                    taskId: activeTaskId
+                    prompt: '',
+                    displayPrompt: '',
+                    historyPrompt: `${getModeSelect('threeD').value} 3D 模型`,
+                    kindOverride: 'model',
+                    extFor: () => 'glb',
+                    filenameFor: (url) => `model-${Date.now()}.${extFromUrl(url, 'glb')}`,
+                    consumeQuota: true
                 });
-                updateQuotaDisplay(consumeOneQuota());
             } else if (currentMode === 'chat') {
                 const userMsg = requirePrompt();
                 const payload = buildChatPayload(userMsg);
@@ -4708,7 +4839,7 @@
                         },
                         data: JSON.stringify(payload)
                     });
-                    if (response.status < 200 || response.status >= 300) throw new Error(requestErrorMessage(response.status, response.data, response.data && response.data.raw));
+                    if (response.status < 200 || response.status >= 300) throw new Error(requestErr(response.status, response.data));
                     const message = response.data.choices && response.data.choices[0] && response.data.choices[0].message;
                     // DeepSeek-R1 类推理模型可能只返回 reasoning_content
                     content = (message && (message.content || message.reasoning_content)) || '';
@@ -4736,7 +4867,7 @@
                     },
                     data: buildAsrForm(file)
                 });
-                if (response.status < 200 || response.status >= 300) throw new Error(requestErrorMessage(response.status, response.data, response.data && response.data.raw));
+                if (response.status < 200 || response.status >= 300) throw new Error(requestErr(response.status, response.data));
                 const text = response.data.text || (response.data.segments && response.data.segments.map(s => s.text).join('')) || '';
                 if (!text) throw new Error('接口未返回识别文本');
                 currentResult = { kind: 'text', text, ext: 'txt' };
@@ -4803,7 +4934,7 @@
         const copyValue = isText ? currentResult.text : (currentResult.sourceUrl || currentResult.url);
         navigator.clipboard.writeText(copyValue).then(() => {
             showStatus('success', isText ? '✅ 文本内容已复制到剪贴板' : '✅ 结果链接已复制到剪贴板');
-            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2000);
+            hideStatusLater(2000);
         }).catch(err => {
             showStatus('error', '❌ 复制失败：' + err);
         });
