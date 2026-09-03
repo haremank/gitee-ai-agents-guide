@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 脚本语法检查
+        run: node --check gitee-ai-workbench.user.js
+      - name: 参数元数据 JSON 校验
+        run: node -e "JSON.parse(require('node:fs').readFileSync('assets/gitee-serverless-controls.compact.json','utf8'));console.log('assets json ok')"
+      - name: 版本一致性（脚本 @version == README 徽章）
+        run: node scripts/check-version.mjs
