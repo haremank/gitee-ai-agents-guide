@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.3
+// @version      2.9.4
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -9,6 +9,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_getResourceText
 // @connect      ai.gitee.com
 // @connect      gitee-ai.su.bcebos.com
 // @connect      raw.githubusercontent.com
@@ -2139,6 +2140,7 @@
     const i2vResolutionSelect = document.getElementById('zimg-i2v-resolution');
 
     function syncImageVideoResolution() {
+        if (!i2vResolutionSelect.value) return; // “自定义”档不覆盖手填的宽高
         const [width, height] = i2vResolutionSelect.value.split('x').map(Number);
         i2vWidthInput.value = width;
         i2vHeightInput.value = height;
@@ -2754,6 +2756,16 @@
         return output && (output.file_url || output.url || output.text_result || '');
     }
 
+    // 轮询/取消地址来自服务端响应且会附带访问令牌，必须校验其源站为 Gitee AI，否则回退到本地拼装的规范地址
+    function safeTaskUrl(value, fallback) {
+        try {
+            const parsed = new URL(String(value || ''), API_BASE);
+            return parsed.origin === new URL(API_BASE).origin ? parsed.href : fallback;
+        } catch (_) {
+            return fallback;
+        }
+    }
+
     function shortTaskId(taskId) {
         const value = String(taskId || '');
         return value.length > 14 ? `${value.slice(0, 8)}…${value.slice(-4)}` : value || '(无 ID)';
@@ -2977,6 +2989,22 @@
     }
 
     async function importCloudTask(task) {
+        const output = task && task.output;
+        const textResult = output && typeof output === 'object' ? output.text_result : '';
+        if (textResult) {
+            // 纯文本产出（如异步文本任务）没有文件地址，直接按文本类型入库
+            await saveLibraryItem({
+                kind: 'text',
+                text: String(textResult),
+                ext: 'txt',
+                filename: `gitee-ai-cloud-text-${task.task_id}.txt`
+            }, '(云端异步任务)', {
+                mode: '',
+                model: '',
+                taskId: task.task_id
+            });
+            return;
+        }
         const url = cloudTaskOutputUrl(task);
         if (!url) throw new Error('成功任务缺少结果地址');
         const kind = mediaKind(url, '');
@@ -3067,8 +3095,8 @@
     function cloudTaskLinkExpired(task) {
         if (!task) return false;
         if (cloudTaskExpired.has(task.task_id)) return true;
-        const ts = Number(task.completed_at || task.created_at || 0);
-        return ts > 0 && Date.now() - ts > CLOUD_TASK_LINK_TTL;
+        const ts = cloudTaskTimestamp(task);
+        return Number.isFinite(ts) && Date.now() - ts > CLOUD_TASK_LINK_TTL;
     }
 
     function resetCloudTaskExpired() {
@@ -3077,6 +3105,14 @@
     importSuccessBtn.addEventListener('click', importAllSuccessfulTasks);
 
     async function previewCloudTask(task) {
+        const output = task && task.output;
+        const textResult = output && typeof output === 'object' ? output.text_result : '';
+        if (textResult) {
+            showResult({ kind: 'text', text: String(textResult), ext: 'txt' }, '(云端异步任务预览)');
+            showStatus('loading', '👁 正在预览云端任务结果（未保存到本地库）');
+            setTimeout(() => { if (!isGenerating) statusBox.style.display = 'none'; }, 2000);
+            return;
+        }
         const url = cloudTaskOutputUrl(task);
         if (!url) {
             showStatus('error', '❌ 该任务没有可预览的结果地址');
@@ -3113,7 +3149,7 @@
     async function cancelCloudTask(task) {
         const token = cleanToken(tokenInput.value);
         if (!token) throw new Error('请先填写或同步访问令牌');
-        const cancelUrl = (task.urls && task.urls.cancel) || `${API_BASE}/v1/task/${encodeURIComponent(task.task_id)}/cancel`;
+        const cancelUrl = safeTaskUrl(task.urls && task.urls.cancel, `${API_BASE}/v1/task/${encodeURIComponent(task.task_id)}/cancel`);
         const response = await requestJson({
             method: 'POST',
             url: cancelUrl,
@@ -3216,10 +3252,14 @@
 
     function showStatus(type, msg) {
         statusBox.className = `zimg-status ${type}`;
+        // msg 可能携带服务端返回的错误原文（可能回显用户 prompt），一律按纯文本渲染，禁止 innerHTML
         if (type === 'loading') {
-            statusBox.innerHTML = `<div class="zimg-spinner"></div><div>${msg}</div>`;
+            statusBox.innerHTML = '<div class="zimg-spinner"></div>';
+            const textNode = document.createElement('div');
+            textNode.textContent = msg;
+            statusBox.appendChild(textNode);
         } else {
-            statusBox.innerHTML = msg;
+            statusBox.textContent = msg;
         }
         statusBox.style.display = 'flex';
     }
@@ -3692,8 +3732,24 @@
 
             const field = document.createElement('div');
             field.className = 'zimg-field zimg-console-field' + (['array', 'multimodal', 'string-array', 'seed-numbers'].includes(control) ? ' zimg-console-wide' : '');
-            const requiredMark = (parameter.q === 1 || (variant && variant.required)) ? ' <b style="color:#dc2626;">*</b>' : '';
-            field.innerHTML = `<div class="zimg-label-row"><span class="zimg-label">${name}${requiredMark}</span><span class="zimg-label-sub">${D(parameter.l)} · ${D(parameter.t)}</span></div>`;
+            // 参数名/位置/类型来自远程参数元数据，用 textContent 组装避免注入
+            const labelRow = document.createElement('div');
+            labelRow.className = 'zimg-label-row';
+            const labelText = document.createElement('span');
+            labelText.className = 'zimg-label';
+            labelText.textContent = name;
+            if (parameter.q === 1 || (variant && variant.required)) {
+                const mark = document.createElement('b');
+                mark.style.color = '#dc2626';
+                mark.textContent = '*';
+                labelText.appendChild(mark);
+            }
+            const labelSub = document.createElement('span');
+            labelSub.className = 'zimg-label-sub';
+            labelSub.textContent = `${D(parameter.l)} · ${D(parameter.t)}`;
+            labelRow.appendChild(labelText);
+            labelRow.appendChild(labelSub);
+            field.appendChild(labelRow);
             const id = consoleInputId(index);
             let input;
             let display = null;
@@ -3749,7 +3805,7 @@
             }
             input.id = id;
             if (control !== 'slider') input.addEventListener('change', updateConsolePreview);
-            if (!display.parentNode || display.parentNode !== field) field.appendChild(input);
+            if (control !== 'slider') field.appendChild(input);
             const help = variant && variant.description !== undefined ? variant.description : D(parameter.d).split('\n')[0];
             if (help) {
                 const note = document.createElement('div');
@@ -4388,7 +4444,7 @@
 
     async function pollTask(taskId, token, prompt) {
         const returnedUrl = activeTaskUrls && (activeTaskUrls.get || activeTaskUrls.status || activeTaskUrls.detail);
-        const statusUrl = returnedUrl || `${API_BASE}/v1/task/${encodeURIComponent(taskId)}`;
+        const statusUrl = safeTaskUrl(returnedUrl, `${API_BASE}/v1/task/${encodeURIComponent(taskId)}`);
         const headers = { Authorization: `Bearer ${token}` };
         const deadline = Date.now() + 15 * 60 * 1000;
         while (Date.now() < deadline) {
@@ -4705,6 +4761,7 @@
         fab.remove();
         overlay.remove();
         agentOverlay.remove();
+        consoleOverlay.remove();
     };
 
 })();
