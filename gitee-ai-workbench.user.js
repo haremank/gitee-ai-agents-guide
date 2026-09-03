@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.6
+// @version      2.9.7
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -120,6 +120,26 @@
     if (window.__Z_IMAGE_DESTROY__) {
         window.__Z_IMAGE_DESTROY__();
     }
+
+    // 站点开关：GM 菜单停用当前站点后，脚本在注入任何样式/DOM/监听之前直接退出，保持零开销
+    const SITE_DISABLED_KEY = 'zimg-disabled-sites';
+    function getDisabledSites() {
+        try { return JSON.parse(safeGM.getValue(SITE_DISABLED_KEY, '[]')) || []; } catch (_) { return []; }
+    }
+    const siteDisabled = getDisabledSites().includes(location.host);
+    if (typeof GM_registerMenuCommand !== 'undefined') {
+        try {
+            GM_registerMenuCommand(siteDisabled ? '✅ 在此站点启用 Gitee AI 工作台' : '🚫 在此站点停用 Gitee AI 工作台', () => {
+                const sites = getDisabledSites();
+                const idx = sites.indexOf(location.host);
+                if (idx >= 0) sites.splice(idx, 1);
+                else sites.push(location.host);
+                safeGM.setValue(SITE_DISABLED_KEY, JSON.stringify(sites));
+                location.reload();
+            });
+        } catch (e) {}
+    }
+    if (siteDisabled) return;
 
     const STORAGE_TOKEN_KEY = 'gitee_ai_custom_token';
     const STORAGE_HISTORY_KEY = 'gitee_ai_zimage_history';
@@ -766,7 +786,6 @@
             user-select: none;
             transition: box-shadow 0.25s, transform 0.15s;
             border: 1px solid rgba(255, 255, 255, 0.35);
-            backdrop-filter: blur(10px);
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif !important;
         }
         #zimg-floating-btn:hover {
@@ -782,7 +801,6 @@
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(15, 23, 42, 0.7);
-            backdrop-filter: blur(6px);
             z-index: 2147483646;
             display: none;
             justify-content: center;
@@ -1408,7 +1426,6 @@
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(15, 23, 42, 0.7);
-            backdrop-filter: blur(6px);
             z-index: 2147483647;
             display: none;
             justify-content: center;
@@ -1477,7 +1494,6 @@
             position: fixed;
             inset: 0;
             background: rgba(15, 23, 42, 0.72);
-            backdrop-filter: blur(6px);
             z-index: 2147483647;
             display: none;
             justify-content: center;
@@ -4962,12 +4978,18 @@
         }
     } catch (e) {}
 
-    // SPA 路由/框架重绘保护：若悬浮按钮或面板被页面移除则自动挂回，保证任意页面可用
+    // SPA 路由/框架重绘保护：若悬浮按钮或面板被页面移除则自动挂回，保证任意页面可用。
+    // 动态页面每秒可能产生大量 DOM 变更，回调做 500ms 去抖（恢复挂载不需要即时性）
+    let persistenceTimer = null;
     const persistenceObserver = new MutationObserver(() => {
-        try {
-            if (fab && !fab.isConnected) document.body.appendChild(fab);
-            if (overlay && !overlay.isConnected) document.body.appendChild(overlay);
-        } catch (e) {}
+        if (persistenceTimer) return;
+        persistenceTimer = setTimeout(() => {
+            persistenceTimer = null;
+            try {
+                if (fab && !fab.isConnected) document.body.appendChild(fab);
+                if (overlay && !overlay.isConnected) document.body.appendChild(overlay);
+            } catch (e) {}
+        }, 500);
     });
     try {
         persistenceObserver.observe(document.body, { childList: true });

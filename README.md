@@ -1,7 +1,7 @@
 # Gitee AI 多模型生成工作台
 
 [![GitHub](https://img.shields.io/badge/GitHub-haremank%2Fgitee--ai--agents--guide-blue?style=flat&logo=github)](https://github.com/haremank/gitee-ai-agents-guide)
-[![Version](https://img.shields.io/badge/版本-v2.9.6-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
+[![Version](https://img.shields.io/badge/版本-v2.9.7-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
 [![Usage](https://img.shields.io/badge/用途-仅限个人学习-red)](https://github.com/haremank/gitee-ai-agents-guide#readme)
 
 基于 Tampermonkey 的油猴脚本：在任意网页提供可拖拽的多模型生成面板，自动获取令牌与额度，支持异步任务轮询、结果预览下载与 Agent 提示词一键导出。
@@ -20,6 +20,7 @@
 - **七种模式**：文生图 / 文生视频 / 图生视频 / 语音合成 / 图片转 3D / 文本对话 / 语音识别
 - **模型化参数**：步数、帧数、fps、分辨率和枚举项随所选模型适配，不做无依据的通用能力承诺
 - **令牌自动管理**：自动提取体验令牌与剩余额度，也可手动填入个人 Key，仅存浏览器本地
+- **站点开关**：油猴菜单可一键停用 / 启用当前站点，停用后脚本零注入零开销；界面去掉了全屏实时模糊特效，滚动更流畅
 - **全参数控制台**：按端点与操作展开 OpenAPI 参数表单，同步接口可直接调用，异步任务可查询 / 取消；付费调用前需二次确认
 - **Agent 提示词导出**：一键导出接口指南（内容与 [`docs/gitee-ai-agents.md`](docs/gitee-ai-agents.md) 基本一致），供 Codex / Claude Code 直接调用
 - **异步全流程**：提交任务 → 自动轮询 → 结果预览 / 下载 / 本地生成库 / 固定目录自动保存
