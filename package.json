@@ -1,0 +1,15 @@
+{
+  "name": "gitee-ai-agents-guide",
+  "private": true,
+  "description": "Gitee AI 多模型生成工作台（Tampermonkey 油猴脚本）",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/pure-functions.test.mjs",
+    "check": "node scripts/check-version.mjs",
+    "fetch-controls": "node scripts/fetch-controls.mjs",
+    "build-controls": "node scripts/build-controls-schema.mjs"
+  }
+}
