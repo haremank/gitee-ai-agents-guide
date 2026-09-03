@@ -1,7 +1,7 @@
 # Gitee AI 多模型生成工作台
 
 [![GitHub](https://img.shields.io/badge/GitHub-haremank%2Fgitee--ai--agents--guide-blue?style=flat&logo=github)](https://github.com/haremank/gitee-ai-agents-guide)
-[![Version](https://img.shields.io/badge/版本-v2.9.10-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
+[![Version](https://img.shields.io/badge/版本-v2.10.0-green)](https://github.com/haremank/gitee-ai-agents-guide/releases/latest)
 [![Usage](https://img.shields.io/badge/用途-仅限个人学习-red)](https://github.com/haremank/gitee-ai-agents-guide#readme)
 
 基于 Tampermonkey 的油猴脚本：在任意网页提供可拖拽的多模型生成面板，自动获取令牌与额度，支持异步任务轮询、结果预览下载与 Agent 提示词一键导出。
@@ -27,13 +27,13 @@
 
 ### 本地生成库
 
-生成结果会自动保存到当前浏览器的 IndexedDB，图片、视频、音频、文本和 3D 文件可在面板内预览、搜索、按类型筛选、单独删除或一键清空。已下载到本地的副本不依赖 Gitee/BOS 签名 URL，因此远程链接过期后仍能打开；旧版 12 条 URL 历史会在首次打开面板时自动迁移。
+本地库统一存放在**油猴脚本自身的存储**（由 Tampermonkey 管理，全站点共享同一份），不再跟随浏览器站点隔离——在任何网站打开面板，看到和保存的都是同一份库。库标题栏标注存储位置，每条内容的卡片会显示其来源站点。图片、视频、音频、文本和 3D 文件可在面板内预览、搜索、按类型筛选、单独删除或一键清空。已取回本地的副本不依赖 Gitee/BOS 签名 URL，远程链接过期后仍能打开。旧版 12 条 URL 历史以及按站点隔离时代的 IndexedDB 数据，会在对应站点首次打开面板时自动合并进共享库（每站点仅迁移一次，原数据保留不删）。
 
-在 Chrome / Edge 等支持 File System Access API 的浏览器中，可以设置一个固定的自动保存目录。新生成或导入成功的内容会先进入 IndexedDB 本地库，再自动写入该目录；Firefox / Safari 等不支持的浏览器仍会保存到本地库，并在面板中提示降级。单独删除或清空本地库时，脚本会同步尝试删除已写入固定目录的文件；如果目录授权已失效，会保留本地记录并提示重新授权，避免误以为文件已删除。
+在 Chrome / Edge 等支持 File System Access API 的浏览器中，可以设置一个固定的自动保存目录。新生成或导入成功的内容会先进入本地库，再自动写入该目录；Firefox / Safari 等不支持的浏览器仍会保存到本地库，并在面板中提示降级。单独删除或清空本地库时，脚本会同步尝试删除已写入固定目录的文件；如果目录授权已失效，会保留本地记录并提示重新授权，避免误以为文件已删除。
 
 面板还会读取 Gitee 官方异步任务列表和并发配额，但只显示近 24 小时内创建的任务，展示等待、进行中、成功、失败、取消数量。移除或取消后的云端卡片会记住状态，刷新后不再重新出现。成功任务可单条或批量下载并导入本地库；导入按 `task_id` 去重，不会重新提交付费任务。失败和取消项只显示原因。
 
-IndexedDB 按浏览器 Profile、站点源点和隐私模式隔离，不会跨浏览器或跨设备同步，也不是备份存储。清理浏览器站点数据会删除本地库；重要产物建议使用固定目录自动保存。
+本地库随 Tampermonkey 数据存续：同一浏览器全站点共用，但不跨浏览器、不跨设备同步，也不是备份存储。清理浏览器「站点数据」不会影响本地库；清空 / 重装 Tampermonkey 或其数据会连同本地库一起删除，重要产物建议使用固定目录自动保存。
 
 ### 标准参数查询
 

@@ -8,7 +8,8 @@ import fs from 'node:fs';
 const src = fs.readFileSync(new URL('../gitee-ai-workbench.user.js', import.meta.url), 'utf8');
 
 function extractFunction(name) {
-    const re = new RegExp(`\\bfunction ${name}\\s*\\(`);
+    // 兼容 async 前缀：截取时必须带上 async，否则函数体内的 await 会成为语法错误
+    const re = new RegExp(`\\b(?:async\\s+)?function ${name}\\s*\\(`);
     const m = src.match(re);
     if (!m) throw new Error(`function ${name} not found`);
     const start = m.index;
@@ -33,6 +34,7 @@ function extractConst(name) {
 const bundle = [
     "'use strict';",
     'const location = { href: "https://example.com/page" };',
+    'const yieldToUi = () => Promise.resolve();',
     extractConst('API_BASE'),
     extractConst('CLOUD_TASK_LINK_TTL'),
     extractFunction('safeTaskUrl'),
@@ -44,8 +46,11 @@ const bundle = [
     extractFunction('formatBytes'),
     extractFunction('sanitizeFilename'),
     extractFunction('shortTaskId'),
-    extractFunction('playableMediaBlob'),
-    'return { safeTaskUrl, cloudTaskTimestamp, isHttpUrl, extFallback, extFromUrl, mediaKind, formatBytes, sanitizeFilename, shortTaskId, playableMediaBlob };'
+    extractFunction('bytesToBase64'),
+    extractFunction('base64ToUint8'),
+    extractFunction('mediaFromChunks'),
+    extractFunction('blobToBase64Chunks'),
+    'return { safeTaskUrl, cloudTaskTimestamp, isHttpUrl, extFallback, extFromUrl, mediaKind, formatBytes, sanitizeFilename, shortTaskId, bytesToBase64, base64ToUint8, mediaFromChunks, blobToBase64Chunks };'
 ].join('\n');
 
 const fns = new Function(bundle)();
@@ -132,13 +137,27 @@ test('shortTaskId: 长任务 ID 缩略，短 ID 原样', () => {
     assert.equal(fns.shortTaskId(''), '(无 ID)');
 });
 
-test('playableMediaBlob: octet-stream 按记录 mime 重打类型，其余原样', () => {
-    const raw = new Blob([new Uint8Array([1, 2, 3])], { type: 'application/octet-stream' });
-    const fixed = fns.playableMediaBlob(raw, 'video/mp4');
-    assert.equal(fixed.type, 'video/mp4');
-    assert.equal(fixed.size, 3);
-    const ok = new Blob([new Uint8Array([1])], { type: 'video/mp4' });
-    assert.equal(fns.playableMediaBlob(ok, 'video/mp4'), ok);
-    assert.equal(fns.playableMediaBlob(raw, ''), raw);
-    assert.equal(fns.playableMediaBlob(null, 'video/mp4'), null);
+test('bytesToBase64 / base64ToUint8: 字节往返一致', () => {
+    const bytes = new Uint8Array([104, 105, 0, 255, 128, 7]);
+    assert.equal(fns.bytesToBase64(bytes), Buffer.from(bytes).toString('base64'));
+    assert.deepEqual(Array.from(fns.base64ToUint8(fns.bytesToBase64(bytes))), Array.from(bytes));
+    assert.equal(fns.bytesToBase64(new Uint8Array(0)), '');
+});
+
+test('媒体分片：blob → base64 分片 → 重建 Blob 内容与类型一致', async () => {
+    const bytes = new Uint8Array(2 * 1024 * 1024 + 1234);
+    for (let i = 0; i < bytes.length; i += 997) bytes[i] = i % 251;
+    const source = new Blob([bytes], { type: 'video/mp4' });
+    const chunks = await fns.blobToBase64Chunks(source, 1024 * 1024);
+    assert.equal(chunks.length, 3);
+    const rebuilt = fns.mediaFromChunks({ mime: 'video/mp4', chunks });
+    assert.equal(rebuilt.type, 'video/mp4');
+    assert.equal(rebuilt.size, bytes.length);
+    const out = new Uint8Array(await rebuilt.arrayBuffer());
+    assert.deepEqual(out, bytes);
+});
+
+test('mediaFromChunks: 空入参返回 null', () => {
+    assert.equal(fns.mediaFromChunks(null), null);
+    assert.equal(fns.mediaFromChunks({ mime: 'video/mp4', chunks: [] }), null);
 });

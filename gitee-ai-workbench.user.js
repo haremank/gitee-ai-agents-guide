@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.9.10
+// @version      2.10.0
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -10,6 +10,7 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_getResourceText
+// @grant        GM_deleteValue
 // @connect      ai.gitee.com
 // @connect      gitee-ai.su.bcebos.com
 // @connect      raw.githubusercontent.com
@@ -276,9 +277,15 @@
     let libraryObjectUrls = [];
     // 本地库软上限：超过后在计数旁提示清理建议，不自动删除任何内容
     const LIBRARY_SOFT_LIMIT = 300;
-    // 列表分页大小：只把最近一页记录（含 blob）载入内存，更早的靠“加载更早的内容”续读
-    const LIBRARY_PAGE_SIZE = 60;
-    let libraryHasMore = false;
+    // 库统一存放在油猴脚本自身的 GM 存储（由 Tampermonkey 管理，全站点共享同一份数据），
+    // 不再使用按站点隔离的 IndexedDB——那是“换个网站库就空了”的根源。媒体内容分片 base64 保存。
+    const LIB_INDEX_KEY = 'zimg-lib-index-v1';
+    const LIB_MEDIA_PREFIX = 'zimg-lib-media:';
+    const LIB_THUMB_PREFIX = 'zimg-lib-thumb:';
+    const LIB_MIGRATED_PREFIX = 'zimg-lib-migrated:';
+    const LIB_CHUNK_BYTES = 4 * 1024 * 1024;
+    const LIB_RENDER_PAGE = 60;
+    let libraryRendered = LIB_RENDER_PAGE;
     let settingsDbReady = null;
     let downloadDirectoryHandle = null;
     let downloadDirectoryNeedsPermission = false;
@@ -326,31 +333,11 @@
         return libraryReady;
     }
 
-    function withLibrary(mode, callback) {
-        return openLibrary().then(db => new Promise((resolve, reject) => {
-            if (!db) {
-                reject(new Error('indexeddb-unavailable'));
-                return;
-            }
-            const tx = db.transaction(LIBRARY_STORE, mode);
-            const store = tx.objectStore(LIBRARY_STORE);
-            const request = callback(store);
-            tx.oncomplete = () => resolve(request && 'result' in request ? request.result : undefined);
-            tx.onerror = () => reject(tx.error || new Error('本地库读写失败'));
-            tx.onabort = () => reject(tx.error || new Error('本地库操作被中断'));
-        }));
-    }
-
-    // 云端任务导入去重：走 taskId 索引做点查，避免为去重把整库读进内存
+    // 云端任务导入去重：库已统一到 GM 存储，索引全站点一致，直接内存比对即可
     async function hasLibraryTaskId(taskId) {
         const key = String(taskId || '');
         if (!key) return false;
-        try {
-            const row = await withLibrary('readonly', store => store.index('taskId').get(key));
-            return Boolean(row);
-        } catch (_) {
-            return libraryList.some(item => item.taskId === taskId);
-        }
+        return libraryList.some(item => item.taskId === key);
     }
 
     function openSettingsDb() {
@@ -2001,7 +1988,7 @@
 
                 <div class="zimg-field" id="zimg-history-section" style="display:none;">
                     <div class="zimg-label-row">
-                        <span class="zimg-label">🗂 本地库 <span class="zimg-label-sub" id="zimg-library-count"></span></span>
+                        <span class="zimg-label">🗂 本地库 <span class="zimg-label-sub" id="zimg-library-count"></span><span class="zimg-label-sub"> · 共享存储（全站点共用）</span></span>
                         <span class="zimg-label-sub" style="cursor:pointer;" id="zimg-btn-clear-history">清空本地库</span>
                     </div>
                     <div class="zimg-library-controls">
@@ -2379,8 +2366,17 @@
     bindFileInput('zimg-3d-file', 'zimg-3d-file-label', 'zimg-3d-file-name');
     bindFileInput('zimg-asr-file', 'zimg-asr-file-label', 'zimg-asr-file-name');
 
+    // 元数据只读查找（不加载媒体内容），删除 / 去重等场景用
+    function getLibraryRecord(id) {
+        return libraryList.find(item => item.id === id) || null;
+    }
+
+    // 取完整条目：媒体内容按需从 GM 存储分片重组
     async function getLibraryItem(id) {
-        return withLibrary('readonly', store => store.get(id));
+        const record = getLibraryRecord(id);
+        if (!record || record.kind === 'text') return record;
+        const blob = mediaFromChunks(gmGet(LIB_MEDIA_PREFIX + id, null));
+        return blob ? { ...record, blob } : record;
     }
 
     // 生成列表用小缩略图：优先 WebP（支持透明），回退 JPEG；失败返回 null，列表回退原图
@@ -2405,6 +2401,93 @@
         }
     }
 
+    // ---- GM 存储访问（仅脚本自身存储，不落 localStorage，避免大值撑爆站点配额）----
+    function gmGet(key, defVal) {
+        try {
+            if (typeof GM_getValue !== 'undefined') {
+                const value = GM_getValue(key, defVal);
+                return value === undefined ? defVal : value;
+            }
+        } catch (_) {}
+        return defVal;
+    }
+
+    function gmSet(key, value) {
+        try {
+            if (typeof GM_setValue !== 'undefined') {
+                GM_setValue(key, value);
+                return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    function gmDel(key) {
+        try {
+            if (typeof GM_deleteValue !== 'undefined') {
+                GM_deleteValue(key);
+                return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    function loadLibraryIndex() {
+        const index = gmGet(LIB_INDEX_KEY, []);
+        return Array.isArray(index) ? index : [];
+    }
+
+    function saveLibraryIndex(index) {
+        gmSet(LIB_INDEX_KEY, index);
+        libraryList = index;
+    }
+
+    function yieldToUi() {
+        return new Promise(resolve => setTimeout(resolve, 0));
+    }
+
+    function bytesToBase64(bytes) {
+        let binary = '';
+        const step = 0x8000;
+        for (let i = 0; i < bytes.length; i += step) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+        }
+        return btoa(binary);
+    }
+
+    function base64ToUint8(b64) {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    }
+
+    async function blobToDataURL(blob) {
+        return `data:${blob.type || 'application/octet-stream'};base64,${bytesToBase64(new Uint8Array(await blob.arrayBuffer()))}`;
+    }
+
+    // 大文件按 4MB 分片转 base64，分片间让出主线程避免卡住页面
+    async function blobToBase64Chunks(blob, chunkBytes = LIB_CHUNK_BYTES) {
+        const chunks = [];
+        let offset = 0;
+        while (offset < blob.size) {
+            const slice = blob.slice(offset, Math.min(offset + chunkBytes, blob.size));
+            chunks.push(bytesToBase64(new Uint8Array(await slice.arrayBuffer())));
+            offset += chunkBytes;
+            await yieldToUi();
+        }
+        return chunks;
+    }
+
+    function mediaFromChunks(payload) {
+        if (!payload || !Array.isArray(payload.chunks) || !payload.chunks.length) return null;
+        try {
+            return new Blob(payload.chunks.map(base64ToUint8), { type: payload.mime || 'application/octet-stream' });
+        } catch (_) {
+            return null;
+        }
+    }
+
     async function saveLibraryItem(result, prompt, meta = {}) {
         const now = Date.now();
         const kind = result.kind || 'image';
@@ -2416,21 +2499,21 @@
 
         if (kind === 'text') {
             text = String(result.text || '');
-            blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-            mime = blob.type;
             localState = 'saved';
         } else if (result.blob) {
             blob = result.blob;
-            mime = blob.type && blob.type !== 'application/octet-stream' ? blob.type : mime;
             localState = 'saved';
         } else if (result.url) {
             try {
                 blob = await requestBlob(result.url, result.ext);
-                mime = blob.type && blob.type !== 'application/octet-stream' ? blob.type : mime;
                 localState = 'saved';
             } catch (error) {
                 console.warn('[Gitee AI Generator] 结果内容下载失败，保留远程地址', error);
             }
+        }
+        if (blob) {
+            const type = String(blob.type || '');
+            mime = type && type !== 'application/octet-stream' ? type : (mime || 'application/octet-stream');
         }
 
         const probed = await probeMedia(blob, kind);
@@ -2443,30 +2526,38 @@
             mode: meta.mode || currentMode,
             model: meta.model || '',
             taskId: meta.taskId || '',
+            origin: location.host, // 生成 / 导入所在的站点，展示在卡片上
             sourceUrl: result.sourceUrl || result.url || '',
             filename: result.filename || `gitee-ai-${kind}-${now}.${ext}`,
             createdAt: now,
-            blob,
-            thumb,
             text,
-            size: blob ? blob.size : 0,
+            size: blob ? blob.size : (kind === 'text' ? text.length : 0),
             mime,
             width: probed.width,
             height: probed.height,
             duration: probed.duration,
-            localState
+            localState,
+            savedFilename: ''
         };
-        await withLibrary('readwrite', store => store.put(record));
-        libraryList.unshift(record);
-        renderLibrary();
+        const index = loadLibraryIndex();
+        index.unshift(record);
+        saveLibraryIndex(index);
+        if (blob) {
+            // 分片 base64 写入 GM 存储（ yieldToUi 已在分片间隙让出主线程）
+            gmSet(LIB_MEDIA_PREFIX + record.id, { mime, chunks: await blobToBase64Chunks(blob) });
+        }
+        if (thumb) {
+            gmSet(LIB_THUMB_PREFIX + record.id, await blobToDataURL(thumb));
+        }
         if (downloadDirectoryHandle) {
             try {
-                await saveRecordToDirectory(record);
+                await saveRecordToDirectory({ ...record, blob });
             } catch (error) {
                 console.warn('[Gitee AI Generator] 自动保存到目录失败', error);
                 renderSaveDirectoryState(`保存失败：${error.message}`);
             }
         }
+        renderLibrary();
         return record.id;
     }
 
@@ -2511,9 +2602,12 @@
         await writable.write(record.blob);
         await writable.close();
         record.savedFilename = filename;
-        await withLibrary('readwrite', store => store.put(record));
-        const existing = libraryList.find(item => item.id === record.id);
-        if (existing) existing.savedFilename = filename;
+        const index = loadLibraryIndex();
+        const existing = index.find(item => item.id === record.id);
+        if (existing) {
+            existing.savedFilename = filename;
+            saveLibraryIndex(index);
+        }
         renderSaveDirectoryState(`最近已保存 ${filename}`);
         return true;
     }
@@ -2633,20 +2727,23 @@
                 mode: '',
                 model: '',
                 taskId: '',
+                origin: location.host,
                 sourceUrl,
                 filename: `legacy-${Date.now()}.${ext}`,
                 createdAt: Date.now(),
-                blob: null,
                 text: kind === 'text' ? String(item.text || '') : '',
                 size: 0,
                 mime: mimeForExt(ext),
                 width: undefined,
                 height: undefined,
                 duration: undefined,
-                localState: kind === 'text' ? 'saved' : 'remote'
+                localState: kind === 'text' ? 'saved' : 'remote',
+                savedFilename: ''
             };
             try {
-                await withLibrary('readwrite', store => store.put(record));
+                const index = loadLibraryIndex();
+                index.unshift(record);
+                saveLibraryIndex(index);
             } catch (error) {
                 console.warn('[Gitee AI Generator] 迁移历史记录失败', error);
             }
@@ -2659,12 +2756,85 @@
         } catch (_) {}
     }
 
+    // 把本站点旧的 IndexedDB 库一次性合并进 GM 共享库（每个站点只执行一次；原数据保留不删）
+    async function migrateIdbLibrary() {
+        const host = location.host;
+        if (gmGet(LIB_MIGRATED_PREFIX + host, false)) return;
+        try {
+            const db = await openLibrary();
+            if (!db) {
+                gmSet(LIB_MIGRATED_PREFIX + host, true);
+                return;
+            }
+            const items = await new Promise((resolve) => {
+                try {
+                    const tx = db.transaction(LIBRARY_STORE, 'readonly');
+                    const request = tx.objectStore(LIBRARY_STORE).getAll();
+                    request.onsuccess = () => resolve(request.result || []);
+                    request.onerror = () => resolve([]);
+                } catch (_) {
+                    resolve([]);
+                }
+            });
+            const index = loadLibraryIndex();
+            const known = new Set(index.map(item => item.id));
+            let migrated = 0;
+            for (const item of items || []) {
+                if (!item || known.has(item.id)) continue;
+                const record = {
+                    id: item.id,
+                    kind: item.kind || 'image',
+                    ext: item.ext || 'bin',
+                    prompt: String(item.prompt || ''),
+                    mode: item.mode || '',
+                    model: item.model || '',
+                    taskId: item.taskId || '',
+                    origin: host,
+                    sourceUrl: item.sourceUrl || '',
+                    filename: item.filename || `gitee-ai-${item.kind || 'image'}-${item.createdAt || Date.now()}.${item.ext || 'bin'}`,
+                    createdAt: item.createdAt || Date.now(),
+                    text: item.text || '',
+                    size: item.size || (item.blob && item.blob.size) || 0,
+                    mime: item.mime || mimeForExt(item.ext || 'bin'),
+                    width: item.width,
+                    height: item.height,
+                    duration: item.duration,
+                    localState: item.blob ? 'saved' : (item.localState || 'remote'),
+                    savedFilename: item.savedFilename || ''
+                };
+                if (item.blob) {
+                    if (item.blob.size > 200 * 1024 * 1024) {
+                        console.warn('[Gitee AI Generator] 超大内容不迁移（保留在原 IndexedDB）', item.id, item.blob.size);
+                        continue;
+                    }
+                    gmSet(LIB_MEDIA_PREFIX + record.id, { mime: record.mime, chunks: await blobToBase64Chunks(item.blob) });
+                }
+                if (item.thumb) {
+                    gmSet(LIB_THUMB_PREFIX + record.id, await blobToDataURL(item.thumb));
+                } else if (item.kind === 'image' && item.blob) {
+                    const thumb = await makeImageThumbnail(item.blob);
+                    if (thumb) gmSet(LIB_THUMB_PREFIX + record.id, await blobToDataURL(thumb));
+                }
+                index.unshift(record);
+                migrated += 1;
+                await yieldToUi();
+            }
+            if (migrated) {
+                saveLibraryIndex(index);
+                console.log(`[Gitee AI Generator] 已合并本站 ${migrated} 条历史记录到共享库`);
+            }
+            gmSet(LIB_MIGRATED_PREFIX + host, true);
+        } catch (error) {
+            console.warn('[Gitee AI Generator] 本站 IndexedDB 库迁移失败（可稍后重开面板重试）', error);
+        }
+    }
+
     function initLibrary() {
         if (libraryInitPromise) return libraryInitPromise;
         libraryInitPromise = (async () => {
-            await openLibrary();
             await migrateLegacyHistory();
-            await refreshLibrary();
+            await migrateIdbLibrary();
+            refreshLibrary();
         })();
         libraryInitPromise.catch(error => {
             console.warn('[Gitee AI Generator] 本地库初始化失败', error);
@@ -2682,69 +2852,14 @@
         return libraryInitPromise;
     }
 
-    // 按创建时间倒序读取一页本地库记录；skipCount>0 时用游标 advance 跳过已载入条目续读
-    function loadLibraryPage(pageSize, skipCount) {
-        return openLibrary().then(db => new Promise((resolve, reject) => {
-            if (!db) {
-                reject(new Error('IndexedDB 不可用（隐私模式限制，或旧标签页仍占用旧版本）'));
-                return;
-            }
-            const items = [];
-            let hasMore = false;
-            let settled = false;
-            let remainingSkip = skipCount;
-            const finish = (result) => {
-                if (settled) return;
-                settled = true;
-                resolve(result);
-            };
-            try {
-                const tx = db.transaction(LIBRARY_STORE, 'readonly');
-                const request = tx.objectStore(LIBRARY_STORE).index('createdAt').openCursor(null, 'prev');
-                request.onsuccess = (event) => {
-                    const cursor = event.target.result;
-                    if (!cursor) {
-                        finish({ items, hasMore });
-                        return;
-                    }
-                    if (remainingSkip > 0) {
-                        const step = remainingSkip;
-                        remainingSkip = 0;
-                        cursor.advance(step);
-                        return;
-                    }
-                    if (items.length >= pageSize) {
-                        hasMore = true;
-                        finish({ items, hasMore });
-                        return;
-                    }
-                    items.push(cursor.value);
-                    cursor.continue();
-                };
-                request.onerror = () => finish({ items, hasMore });
-            } catch (_) {
-                finish({ items, hasMore });
-            }
-        }));
-    }
-
-    async function refreshLibrary() {
-        const page = await loadLibraryPage(LIBRARY_PAGE_SIZE, 0);
-        libraryList = page.items;
-        libraryHasMore = page.hasMore;
+    function refreshLibrary() {
+        libraryList = loadLibraryIndex();
         renderLibrary();
     }
 
-    async function loadMoreLibrary() {
-        if (!libraryHasMore) return;
-        try {
-            const page = await loadLibraryPage(LIBRARY_PAGE_SIZE, libraryList.length);
-            libraryList = libraryList.concat(page.items);
-            libraryHasMore = page.hasMore;
-            renderLibrary();
-        } catch (error) {
-            showStatus('error', `❌ 本地库加载失败：${error.message}`);
-        }
+    function loadMoreLibrary() {
+        libraryRendered += LIB_RENDER_PAGE;
+        renderLibrary();
     }
 
     function libraryMatches(item) {
@@ -2768,18 +2883,20 @@
         libraryObjectUrls = [];
         // 本地库板块常驻默认位置：空库显示占位说明，不再自动隐藏
         historySection.style.display = 'block';
-        const items = libraryList.filter(libraryMatches);
+        const filtered = libraryList.filter(libraryMatches);
+        const items = filtered.slice(0, libraryRendered);
         const totalBytes = libraryList.reduce((sum, item) => sum + (item.size || 0), 0);
-        libraryCount.textContent = `${items.length} / ${libraryList.length} · ${formatBytes(totalBytes)}` +
+        libraryCount.textContent = `${filtered.length} / ${libraryList.length} · ${formatBytes(totalBytes)}` +
             (libraryList.length > LIBRARY_SOFT_LIMIT ? ' · 建议清理' : '');
-        libraryCount.title = libraryList.length > LIBRARY_SOFT_LIMIT
-            ? `本地库已有 ${libraryList.length} 条记录，占用约 ${formatBytes(totalBytes)}；可逐条删除或使用“清空本地库”`
-            : '';
+        libraryCount.title = `存储位置：油猴脚本共享存储（Tampermonkey 管理，全站点共用同一份库，不随浏览站点变化）`
+            + (libraryList.length > LIBRARY_SOFT_LIMIT
+                ? `；本地库已有 ${libraryList.length} 条记录，占用约 ${formatBytes(totalBytes)}，可逐条删除或使用“清空本地库”`
+                : '');
         historyStrip.innerHTML = '';
         if (!libraryList.length) {
             const empty = document.createElement('div');
             empty.className = 'zimg-library-empty';
-            empty.textContent = '本地库为空。注意：本地库按浏览器站点隔离——在哪个网站生成 / 导入，就到那个网站查看。';
+            empty.textContent = '本地库为空。生成成功或导入云端任务后会自动进入本地库，全站点共用这一份。';
             historyStrip.appendChild(empty);
             return;
         }
@@ -2798,6 +2915,7 @@
             card.title = [
                 item.prompt || '(无提示词)',
                 `类型：${kindLabels[item.kind] || item.kind}`,
+                item.origin ? `站点：${item.origin}` : '',
                 item.model ? `模型：${item.model}` : '',
                 item.size ? `大小：${formatBytes(item.size)}` : '',
                 item.width ? `尺寸：${item.width}×${item.height}` : '',
@@ -2807,11 +2925,9 @@
             if (item.kind === 'image') {
                 const thumb = document.createElement('img');
                 thumb.alt = item.prompt || '本地生成图片';
-                const thumbBlob = item.thumb || item.blob;
-                if (thumbBlob) {
-                    const objectUrl = URL.createObjectURL(thumbBlob);
-                    libraryObjectUrls.push(objectUrl);
-                    thumb.src = objectUrl;
+                const thumbData = gmGet(LIB_THUMB_PREFIX + item.id, '');
+                if (thumbData) {
+                    thumb.src = thumbData;
                 } else {
                     thumb.src = item.sourceUrl;
                 }
@@ -2825,7 +2941,9 @@
 
             const badge = document.createElement('span');
             badge.className = 'zimg-library-badge';
-            badge.textContent = `${kindLabels[item.kind] || item.kind}${item.localState === 'remote' ? ' · 远程' : ''}`;
+            badge.textContent = `${kindLabels[item.kind] || item.kind}`
+                + `${item.localState === 'remote' ? ' · 远程' : ''}`
+                + `${item.origin ? ' · ' + item.origin : ''}`;
             const deleteBtn = document.createElement('button');
             deleteBtn.type = 'button';
             deleteBtn.className = 'zimg-library-delete';
@@ -2840,27 +2958,13 @@
             card.append(badge, deleteBtn);
             historyStrip.appendChild(card);
         });
-        if (libraryHasMore) {
+        if (filtered.length > items.length) {
             const moreBtn = document.createElement('button');
             moreBtn.type = 'button';
             moreBtn.className = 'zimg-library-more';
-            moreBtn.textContent = `加载更早的内容（已显示 ${libraryList.length} 条）…`;
+            moreBtn.textContent = `加载更早的内容（已显示 ${items.length} 条）…`;
             moreBtn.addEventListener('click', loadMoreLibrary);
             historyStrip.appendChild(moreBtn);
-        }
-    }
-
-    // 老记录的 blob 可能带着 BOS 返回的 application/octet-stream 错误类型，<video>/<audio> 会拒绝播放；
-    // 按记录里存的 mime（由扩展名推导）重打类型，其余情况原样返回
-    function playableMediaBlob(blob, mimeHint) {
-        if (!blob) return blob;
-        const type = String(blob.type || '');
-        if (type && type !== 'application/octet-stream') return blob;
-        if (!mimeHint) return blob;
-        try {
-            return blob.slice(0, blob.size, mimeHint);
-        } catch (_) {
-            return blob;
         }
     }
 
@@ -2868,7 +2972,7 @@
         try {
             const item = await getLibraryItem(id);
             if (!item) {
-                await refreshLibrary();
+                refreshLibrary();
                 return;
             }
             let objectUrl = '';
@@ -2877,7 +2981,7 @@
                 result = { kind: 'text', text: item.text || '', ext: item.ext || 'txt' };
             } else if (item.blob) {
                 releaseCurrentObjectUrl();
-                objectUrl = URL.createObjectURL(playableMediaBlob(item.blob, item.mime));
+                objectUrl = URL.createObjectURL(item.blob);
                 result = { url: objectUrl, kind: item.kind, ext: item.ext, filename: item.filename };
             } else if ((item.kind === 'video' || item.kind === 'audio') && isHttpUrl(item.sourceUrl)) {
                 // 无本地副本的记录：直链在第三方页面会被防盗链拦截，先取回再播，失败回退直链
@@ -2904,17 +3008,19 @@
 
     async function deleteLibraryItem(id) {
         try {
-            const record = await getLibraryItem(id);
+            const record = getLibraryRecord(id);
             if (!record) {
-                await refreshLibrary();
+                refreshLibrary();
                 return;
             }
             if (record.savedFilename && downloadDirectoryHandle &&
                 !(await deleteRecordFile(record))) {
                 throw new Error('目录文件删除失败，请重新授权保存目录');
             }
-            await withLibrary('readwrite', store => store.delete(id));
-            await refreshLibrary();
+            gmDel(LIB_MEDIA_PREFIX + id);
+            gmDel(LIB_THUMB_PREFIX + id);
+            saveLibraryIndex(loadLibraryIndex().filter(item => item.id !== id));
+            refreshLibrary();
             showStatus('success', '🗑 已删除这条本地记录');
             hideStatusLater(1500);
         } catch (error) {
@@ -2941,11 +3047,17 @@
                     throw new Error('目录文件删除失败，已保留本地记录');
                 }
             }
-            await withLibrary('readwrite', store => store.clear());
+            for (const record of records) {
+                gmDel(LIB_MEDIA_PREFIX + record.id);
+                gmDel(LIB_THUMB_PREFIX + record.id);
+            }
+            saveLibraryIndex([]);
             historyList = [];
-            safeGM.setValue(STORAGE_HISTORY_KEY, '[]');
-            localStorage.removeItem(STORAGE_HISTORY_KEY);
-            await refreshLibrary();
+            try {
+                safeGM.setValue(STORAGE_HISTORY_KEY, '[]');
+                localStorage.removeItem(STORAGE_HISTORY_KEY);
+            } catch (_) {}
+            refreshLibrary();
             showStatus('success', '🧹 本地库已清空');
             hideStatusLater(1500);
         } catch (error) {
