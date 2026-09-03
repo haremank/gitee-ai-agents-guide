@@ -292,6 +292,7 @@
                 resolve(libraryDb);
             };
             request.onerror = () => resolve(null);
+            request.onblocked = () => resolve(null); // 旧标签页持库连接时避免永久挂起
         });
         return libraryReady;
     }
@@ -327,6 +328,7 @@
             };
             request.onsuccess = () => resolve(request.result);
             request.onerror = () => resolve(null);
+            request.onblocked = () => resolve(null);
         });
         return settingsDbReady;
     }
@@ -2758,8 +2760,9 @@
 
     // 轮询/取消地址来自服务端响应且会附带访问令牌，必须校验其源站为 Gitee AI，否则回退到本地拼装的规范地址
     function safeTaskUrl(value, fallback) {
+        if (!value) return fallback; // 空值直接走 fallback：空串会解析成 API 根路径
         try {
-            const parsed = new URL(String(value || ''), API_BASE);
+            const parsed = new URL(String(value), API_BASE);
             return parsed.origin === new URL(API_BASE).origin ? parsed.href : fallback;
         } catch (_) {
             return fallback;
@@ -2783,10 +2786,6 @@
         const timestamp = typeof value === 'number' ? value : new Date(value).getTime();
         if (!Number.isFinite(timestamp)) return NaN;
         return timestamp < 1e12 ? timestamp * 1000 : timestamp;
-    }
-
-    function cloudTaskDisplayTimestamp(task) {
-        return task.created_at || task.completed_at;
     }
 
     function isCloudTaskInWindow(task, cutoff) {
@@ -2886,7 +2885,7 @@
             status.textContent = statusLabels[task.status] || task.status || '未知';
             const time = document.createElement('div');
             time.className = 'zimg-cloud-meta';
-            time.textContent = formatCloudTime(cloudTaskDisplayTimestamp(task));
+            time.textContent = formatCloudTime(cloudTaskTimestamp(task));
             card.append(id, status, time);
             if (task.status === 'success' && cloudTaskOutputUrl(task)) {
                 const imported = libraryList.some(item => item.taskId === task.task_id);
@@ -3095,8 +3094,13 @@
     function cloudTaskLinkExpired(task) {
         if (!task) return false;
         if (cloudTaskExpired.has(task.task_id)) return true;
-        const ts = cloudTaskTimestamp(task);
-        return Number.isFinite(ts) && Date.now() - ts > CLOUD_TASK_LINK_TTL;
+        // 签名链接自任务完成时起约 24h 有效，因此过期判断优先取 completed_at；秒/毫秒需归一化
+        const value = task.completed_at || task.created_at;
+        if (value === undefined || value === null || value === '') return false;
+        let ts = typeof value === 'number' ? value : new Date(value).getTime();
+        if (!Number.isFinite(ts)) return false;
+        if (ts < 1e12) ts *= 1000;
+        return Date.now() - ts > CLOUD_TASK_LINK_TTL;
     }
 
     function resetCloudTaskExpired() {
@@ -3632,17 +3636,20 @@
 
     async function loadControlsSchema() {
         if (controlsSchema) return controlsSchema;
-        let text = '';
+        let schema = null;
         try {
-            if (typeof GM_getResourceText !== 'undefined') text = GM_getResourceText('GITEE_CONTROLS') || '';
+            if (typeof GM_getResourceText !== 'undefined') {
+                schema = parseJsonSafe(GM_getResourceText('GITEE_CONTROLS') || '', null);
+            }
         } catch (_) {}
-        if (!text) {
+        // 快照缺失或内容无效时都回退到网络加载
+        if (!schema || !Array.isArray(schema.e)) {
             const response = await makeRequest({ method: 'GET', url: CONTROLS_FALLBACK_URL, timeout: 20000 });
             if (response.status < 200 || response.status >= 300) throw new Error(`参数元数据加载失败：HTTP ${response.status}`);
-            text = response.responseText;
+            schema = parseJsonSafe(response.responseText, null);
         }
-        controlsSchema = parseJsonSafe(text, null);
-        if (!controlsSchema || !Array.isArray(controlsSchema.e)) throw new Error('参数元数据格式无效');
+        if (!schema || !Array.isArray(schema.e)) throw new Error('参数元数据格式无效');
+        controlsSchema = schema;
         consoleEndpoints = controlsSchema.e.map(endpoint => ({
             ...endpoint,
             method: 'POST',
@@ -3825,6 +3832,10 @@
 
     function updateConsoleSource() {
         const endpoint = selectedConsoleEndpoint();
+        if (!endpoint) {
+            document.getElementById('zimg-console-source').textContent = '参数元数据尚未加载，请先重新打开控制台。';
+            return;
+        }
         const operationIndex = Number(document.getElementById('zimg-console-operation').value || 0);
         const operation = (endpoint.o || [])[operationIndex];
         const model = D(operation && operation.model);
@@ -4071,9 +4082,14 @@
                 activeTaskId = taskId;
                 activeTaskUrls = created.data.urls || created.data.task_urls || null;
                 state.textContent = `任务已提交：${taskId}`;
+                generateStartTime = Date.now(); // 控制台独立于主面板计时
                 const resultUrl = await pollTask(taskId, cleanToken(tokenInput.value), '');
                 const extracted = extractConsoleResult(created.data) || resultUrl;
-                currentResult = { url: extracted, kind: mediaKind(extracted, 'console'), ext: extFromUrl(extracted, 'bin') };
+                if (isHttpUrl(extracted)) {
+                    currentResult = { url: extracted, kind: mediaKind(extracted, 'console'), ext: extFromUrl(extracted, 'bin') };
+                } else {
+                    currentResult = { kind: 'text', text: String(extracted), ext: 'txt' };
+                }
                 showResult(currentResult, '控制台任务');
                 addToHistory(currentResult, '控制台任务', consoleMeta);
             } else {
@@ -4188,6 +4204,7 @@
         clearInterval(generateTimer);
         generateBtn.disabled = false;
         cancelBtn.style.display = 'none';
+        generateStartTime = 0;
     }
 
     function optionalNumber(value) {
@@ -4433,6 +4450,10 @@
         return form;
     }
 
+    function isHttpUrl(value) {
+        return /^(https?:|data:)/i.test(String(value || ''));
+    }
+
     function mediaKind(url, mode) {
         const ext = extFromUrl(url, '');
         if (['mp4', 'webm', 'mov'].includes(ext)) return 'video';
@@ -4447,6 +4468,8 @@
         const statusUrl = safeTaskUrl(returnedUrl, `${API_BASE}/v1/task/${encodeURIComponent(taskId)}`);
         const headers = { Authorization: `Bearer ${token}` };
         const deadline = Date.now() + 15 * 60 * 1000;
+        if (!generateStartTime) generateStartTime = Date.now(); // 控制台路径未经 beginGeneration，避免耗时显示异常
+        let transientErrors = 0;
         while (Date.now() < deadline) {
             for (let i = 0; i < 16 && !cancelRequested; i++) {
                 await sleep(250);
@@ -4458,10 +4481,13 @@
             try {
                 response = await requestJson({ method: 'GET', url: statusUrl, headers });
             } catch (_) {
+                if (++transientErrors > 5) throw new Error('任务状态查询连续失败，请稍后在 Gitee AI 任务页查看结果');
                 continue;
             }
             const task = response.data || {};
             if (response.status < 200 || response.status >= 300) {
+                // 429/5xx 视为瞬时故障继续轮询（间隔约 4 秒，天然退避）；其余状态码立即报错
+                if ((response.status === 429 || response.status >= 500) && ++transientErrors <= 5) continue;
                 throw new Error(requestErrorMessage(response.status, task, response.data && response.data.raw));
             }
             if (task.status === 'success') {
@@ -4496,8 +4522,13 @@
         activeTaskUrls = created.data.urls || created.data.task_urls || null;
         cancelBtn.style.display = '';
         const url = await pollTask(taskId, token, prompt);
-        const kind = mediaKind(url, currentMode);
-        showResult({ url, kind, ext: extFromUrl(url, { video: 'mp4', audio: 'mpeg', model: 'glb' }[kind] || 'bin') }, prompt);
+        if (isHttpUrl(url)) {
+            const kind = mediaKind(url, currentMode);
+            showResult({ url, kind, ext: extFromUrl(url, { video: 'mp4', audio: 'mpeg', model: 'glb' }[kind] || 'bin') }, prompt);
+        } else {
+            // 异步文本类任务返回 output.text_result，是纯文本而非 URL
+            showResult({ kind: 'text', text: String(url), ext: 'txt' }, prompt);
+        }
         addToHistory(currentResult, prompt, {
             mode: currentMode,
             model: getModeSelect(currentMode).value,
@@ -4548,6 +4579,7 @@
             } else if (currentMode === 'textVideo') {
                 const prompt = requirePrompt();
                 await runJsonGeneration(ENDPOINTS.textVideo, buildTextVideoPayload(prompt), prompt, token);
+                updateQuotaDisplay(consumeOneQuota());
             } else if (currentMode === 'speech') {
                 const text = requirePrompt();
                 await runJsonGeneration(ENDPOINTS.speech, buildSpeechPayload(text), text, token);
@@ -4569,13 +4601,16 @@
                 activeTaskUrls = created.data.urls || created.data.task_urls || null;
                 cancelBtn.style.display = '';
                 const url = await pollTask(activeTaskId, token, prompt);
-                currentResult = { url, kind: 'video', ext: extFromUrl(url, 'mp4') };
+                currentResult = isHttpUrl(url)
+                    ? { url, kind: 'video', ext: extFromUrl(url, 'mp4') }
+                    : { kind: 'text', text: String(url), ext: 'txt' };
                 showResult(currentResult, prompt);
                 addToHistory(currentResult, prompt, {
                     mode: 'imageVideo',
                     model: getModeSelect('imageVideo').value,
                     taskId: activeTaskId
                 });
+                updateQuotaDisplay(consumeOneQuota());
             } else if (currentMode === 'threeD') {
                 const file = requireFile('zimg-3d-file');
                 const created = await requestJson({
@@ -4593,13 +4628,16 @@
                 activeTaskUrls = created.data.urls || created.data.task_urls || null;
                 cancelBtn.style.display = '';
                 const url = await pollTask(activeTaskId, token, '');
-                currentResult = { url, kind: 'model', ext: extFromUrl(url, 'glb'), filename: `model-${Date.now()}.${extFromUrl(url, 'glb')}` };
+                currentResult = isHttpUrl(url)
+                    ? { url, kind: 'model', ext: extFromUrl(url, 'glb'), filename: `model-${Date.now()}.${extFromUrl(url, 'glb')}` }
+                    : { kind: 'text', text: String(url), ext: 'txt' };
                 showResult(currentResult, '');
                 addToHistory(currentResult, `${getModeSelect('threeD').value} 3D 模型`, {
                     mode: 'threeD',
                     model: getModeSelect('threeD').value,
                     taskId: activeTaskId
                 });
+                updateQuotaDisplay(consumeOneQuota());
             } else if (currentMode === 'chat') {
                 const userMsg = requirePrompt();
                 const payload = buildChatPayload(userMsg);
@@ -4682,7 +4720,7 @@
         try {
             await requestJson({
                 method: 'POST',
-                url: (activeTaskUrls && activeTaskUrls.cancel) || `${API_BASE}/v1/task/${encodeURIComponent(activeTaskId)}/cancel`,
+                url: safeTaskUrl(activeTaskUrls && activeTaskUrls.cancel, `${API_BASE}/v1/task/${encodeURIComponent(activeTaskId)}/cancel`),
                 headers: { Authorization: `Bearer ${cleanToken(tokenInput.value)}` }
             });
             showStatus('error', '⏹ 正在取消云端任务...');
