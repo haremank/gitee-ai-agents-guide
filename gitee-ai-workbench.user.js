@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gitee AI - 多模型生成工作台
 // @namespace    https://ai.gitee.com/
-// @version      2.11.0
+// @version      2.11.1
 // @description  在任意网站提供可拖拽的多模型生成入口，按文生图、文生视频、图生视频、语音合成、图片转 3D、文本对话（免费 Qwen3/GLM4/DeepSeek-R1 全家桶）和语音识别（免费 GLM-ASR/SenseVoice）显示不同参数面板；分辨率和能力按官方模型元数据动态适配。自动获取访问令牌，支持一键导出 Agent 提示词（供 Codex / Claude Code 等直接调用接口），支持异步任务轮询、全参数控制台、结果预览、下载与 IndexedDB 本地生成库。
 // @author       Antigravity
 // @match        *://*/*
@@ -284,6 +284,9 @@
     const LIB_THUMB_PREFIX = 'zimg-lib-thumb:';
     const LIB_MIGRATED_PREFIX = 'zimg-lib-migrated:';
     const LIB_CHUNK_BYTES = 4 * 1024 * 1024;
+    // 目录为主存储时，≤ 此大小的内容会额外保留一份脚本存储分片作为预览兜底
+    // （目录授权失效或跨站点打开时仍可播放；更大的文件只存目录）
+    const LIB_MEDIA_MIRROR_LIMIT = 50 * 1024 * 1024;
     const LIB_RENDER_PAGE = 60;
     let libraryRendered = LIB_RENDER_PAGE;
     let settingsDbReady = null;
@@ -2599,7 +2602,8 @@
                     renderSaveDirectoryState(`保存失败：${error.message}`);
                 }
             }
-            if (!writtenToDisk) {
+            // 目录写入成功时，≤50MB 的内容额外保留脚本存储分片兜底；更大文件只存目录
+            if (!writtenToDisk || blob.size <= LIB_MEDIA_MIRROR_LIMIT) {
                 gmSet(LIB_MEDIA_PREFIX + record.id, { mime, chunks: await blobToBase64Chunks(blob) });
             }
         } else if (blob && kind === 'text' && downloadDirectoryHandle) {
@@ -3039,11 +3043,28 @@
             } else {
                 // 默认读取顺序：指定目录中的文件 → 脚本存储分片 → 远端直链取回
                 let blob = null;
+                let diskDenied = false;
                 if (item.savedFilename && downloadDirectoryHandle) {
-                    try {
+                    const readDisk = async () => {
                         const fileHandle = await downloadDirectoryHandle.getFileHandle(item.savedFilename);
-                        blob = await fileHandle.getFile();
-                    } catch (_) {}
+                        return fileHandle.getFile();
+                    };
+                    try {
+                        blob = await readDisk();
+                    } catch (_) {
+                        // 授权失效（浏览器重启后常见）：点击卡片本身是用户手势，就地请求一次授权并重试
+                        try {
+                            if (await hasDirectoryPermission(downloadDirectoryHandle, true)) {
+                                downloadDirectoryNeedsPermission = false;
+                                renderSaveDirectoryState();
+                                blob = await readDisk();
+                            } else {
+                                diskDenied = true;
+                            }
+                        } catch (_) {
+                            diskDenied = true;
+                        }
+                    }
                 }
                 if (!blob) blob = mediaFromChunks(gmGet(LIB_MEDIA_PREFIX + id, null));
                 if (!blob && (item.kind === 'video' || item.kind === 'audio') && isHttpUrl(item.sourceUrl)) {
@@ -3061,6 +3082,11 @@
                     result = { url: objectUrl, kind: item.kind, ext: item.ext, filename: item.filename };
                 } else {
                     result = { url: item.sourceUrl, kind: item.kind, ext: item.ext, filename: item.filename };
+                    if (diskDenied && item.savedFilename) {
+                        showStatus('error', `⚠️ 文件在指定目录中，但目录授权已失效：请到「保存目录」处点「🔑 重新授权」后再预览`);
+                    } else if (item.savedFilename && item.origin && item.origin !== location.host) {
+                        showStatus('loading', `⚠️ 该文件保存在站点 ${item.origin} 的指定目录中，需在该站点（或重新授权目录后）预览`);
+                    }
                 }
             }
             result.sourceUrl = item.sourceUrl || '';
